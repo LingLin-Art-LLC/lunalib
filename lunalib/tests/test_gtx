@@ -1,0 +1,71 @@
+import pytest
+from gtx.genesis import GTXGenesis
+from gtx.digital_bill import DigitalBill
+
+class TestGTXGenesis:
+    def test_digital_bill_creation(self, test_gtx):
+        """Test digital bill creation"""
+        bill = test_gtx.create_genesis_bill(
+            denomination=1000,
+            user_address="LUN_test_address_123",
+            custom_data={"issuer": "test"}
+        )
+        
+        assert bill.denomination == 1000
+        assert bill.user_address == "LUN_test_address_123"
+        assert bill.bill_data["issuer"] == "test"
+        assert bill.bill_serial.startswith("GTX1000_")
+
+    def test_bill_mining_data(self, test_gtx):
+        """Test bill mining data generation"""
+        bill = test_gtx.create_genesis_bill(100, "LUN_test")
+        mining_data = bill.get_mining_data(nonce=123)
+        
+        assert mining_data["type"] == "GTX_Genesis"
+        assert mining_data["denomination"] == 100
+        assert mining_data["nonce"] == 123
+        assert "previous_hash" in mining_data
+
+    def test_bill_finalization(self, test_gtx):
+        """Test bill finalization after mining"""
+        bill = test_gtx.create_genesis_bill(1000, "LUN_test")
+        
+        final_bill = bill.finalize(
+            hash="000abc123",
+            nonce=12345,
+            mining_time=3.2
+        )
+        
+        assert final_bill["success"] is True
+        assert final_bill["hash"] == "000abc123"
+        assert final_bill["mining_time"] == 3.2
+        assert "transaction_data" in final_bill
+
+    def test_bill_verification(self, test_gtx, temp_dir):
+        """Test bill verification"""
+        # Create and "mine" a bill
+        bill = test_gtx.create_genesis_bill(100, "LUN_test_verify")
+        final_bill = bill.finalize("000testhash", 123, 1.0)
+        
+        # Test verification
+        result = test_gtx.verify_bill(final_bill["bill_serial"])
+        assert result["valid"] is True
+
+    def test_invalid_bill_verification(self, test_gtx):
+        """Test verification of non-existent bill"""
+        result = test_gtx.verify_bill("GTX_invalid_serial")
+        assert result["valid"] is False
+        assert "error" in result
+
+    def test_portfolio_management(self, test_gtx, temp_dir):
+        """Test user portfolio functionality"""
+        # Add some test bills to registry
+        for denom in [100, 1000, 10000]:
+            bill = test_gtx.create_genesis_bill(denom, "LUN_test_user")
+            bill.finalize(f"000hash{denom}", 123, 1.0)
+        
+        portfolio = test_gtx.get_user_portfolio("LUN_test_user")
+        
+        assert portfolio["user_address"] == "LUN_test_user"
+        assert portfolio["total_bills"] == 3
+        assert portfolio["total_luna_value"] == 11100  # 100 + 1000 + 10000
