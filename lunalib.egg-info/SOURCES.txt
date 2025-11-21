@@ -13,6 +13,7 @@ lunalib.egg-info/top_level.txt
 lunalib/core/__init__.py
 lunalib/core/blockchain.py
 lunalib/core/crypto.py
+lunalib/core/mempool.py
 lunalib/core/wallet.py
 lunalib/gtx/__init__.py
 lunalib/gtx/bill_registry.py

@@ -19,7 +19,7 @@ else:
 
 setup(
     name="lunalib",
-    version="1.0.0",  # Consider using semantic versioning like "1.0.0"
+    version="1.1.4",  # Consider using semantic versioning like "1.0.0"
     author="Ling Lin",
     author_email="taellinglin@gmail.com",
     description="A Complete Cryptocurrency Wallet and Mining System",

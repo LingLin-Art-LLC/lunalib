@@ -1,3 +1,5 @@
+# blockchain.py - Updated version
+
 from lunalib.storage.cache import BlockchainCache
 import requests
 import time
@@ -6,44 +8,178 @@ from typing import Dict, List, Optional, Tuple
 
 
 class BlockchainManager:
-    """Manages blockchain interactions and scanning"""
+    """Manages blockchain interactions and scanning with transaction broadcasting"""
     
     def __init__(self, endpoint_url="https://bank.linglin.art"):
         self.endpoint_url = endpoint_url.rstrip('/')
         self.cache = BlockchainCache()
         self.network_connected = False
         
+    def broadcast_transaction(self, transaction: Dict) -> Tuple[bool, str]:
+        """Broadcast transaction to mempool with enhanced error handling"""
+        try:
+            print(f"🔄 Broadcasting transaction to {self.endpoint_url}/mempool/add")
+            print(f"   Transaction type: {transaction.get('type', 'unknown')}")
+            print(f"   From: {transaction.get('from', 'unknown')}")
+            print(f"   To: {transaction.get('to', 'unknown')}")
+            print(f"   Amount: {transaction.get('amount', 'unknown')}")
+            
+            # Ensure transaction has required fields
+            if not self._validate_transaction_before_broadcast(transaction):
+                return False, "Transaction validation failed"
+            
+            response = requests.post(
+                f'{self.endpoint_url}/mempool/add',
+                json=transaction,
+                headers={'Content-Type': 'application/json'},
+                timeout=30
+            )
+            
+            print(f"📡 Broadcast response: HTTP {response.status_code}")
+            
+            if response.status_code in [200, 201]:
+                result = response.json()
+                if result.get('success'):
+                    tx_hash = result.get('transaction_hash', transaction.get('hash', 'unknown'))
+                    print(f"✅ Transaction broadcast successful! Hash: {tx_hash}")
+                    return True, f"Transaction broadcast successfully: {tx_hash}"
+                else:
+                    error_msg = result.get('error', 'Unknown error from server')
+                    print(f"❌ Broadcast failed: {error_msg}")
+                    return False, f"Server rejected transaction: {error_msg}"
+            else:
+                error_msg = f"HTTP {response.status_code}: {response.text}"
+                print(f"❌ Network error: {error_msg}")
+                return False, error_msg
+                
+        except requests.exceptions.ConnectionError:
+            error_msg = "Cannot connect to blockchain server"
+            print(f"❌ {error_msg}")
+            return False, error_msg
+        except requests.exceptions.Timeout:
+            error_msg = "Broadcast request timed out"
+            print(f"❌ {error_msg}")
+            return False, error_msg
+        except Exception as e:
+            error_msg = f"Unexpected error: {str(e)}"
+            print(f"❌ {error_msg}")
+            return False, error_msg
+    
+    def _validate_transaction_before_broadcast(self, transaction: Dict) -> bool:
+        """Validate transaction before broadcasting"""
+        required_fields = ['type', 'from', 'to', 'amount', 'timestamp', 'hash', 'signature']
+        
+        for field in required_fields:
+            if field not in transaction:
+                print(f"❌ Missing required field: {field}")
+                return False
+        
+        # Validate addresses
+        if not transaction['from'].startswith('LUN_'):
+            print(f"❌ Invalid from address format: {transaction['from']}")
+            return False
+            
+        if not transaction['to'].startswith('LUN_'):
+            print(f"❌ Invalid to address format: {transaction['to']}")
+            return False
+        
+        # Validate amount
+        try:
+            amount = float(transaction['amount'])
+            if amount <= 0:
+                print(f"❌ Invalid amount: {amount}")
+                return False
+        except (ValueError, TypeError):
+            print(f"❌ Invalid amount format: {transaction['amount']}")
+            return False
+        
+        # Validate signature
+        if not transaction.get('signature') or len(transaction['signature']) < 10:
+            print(f"❌ Invalid or missing signature")
+            return False
+        
+        # Validate hash
+        if not transaction.get('hash') or len(transaction['hash']) < 10:
+            print(f"❌ Invalid or missing transaction hash")
+            return False
+        
+        print("✅ Transaction validation passed")
+        return True
+
+    def get_transaction_status(self, tx_hash: str) -> Dict:
+        """Check transaction status (pending/confirmed)"""
+        try:
+            # First check mempool for pending transactions
+            mempool_txs = self.get_mempool()
+            for tx in mempool_txs:
+                if tx.get('hash') == tx_hash:
+                    return {
+                        'status': 'pending',
+                        'message': 'Transaction is in mempool waiting to be mined',
+                        'confirmations': 0
+                    }
+            
+            # Then check blockchain for confirmed transactions
+            current_height = self.get_blockchain_height()
+            for height in range(max(0, current_height - 100), current_height + 1):
+                block = self.get_block(height)
+                if block:
+                    for tx in block.get('transactions', []):
+                        if tx.get('hash') == tx_hash:
+                            confirmations = current_height - height + 1
+                            return {
+                                'status': 'confirmed',
+                                'message': f'Transaction confirmed in block {height}',
+                                'confirmations': confirmations,
+                                'block_height': height
+                            }
+            
+            return {
+                'status': 'unknown',
+                'message': 'Transaction not found in mempool or recent blocks'
+            }
+            
+        except Exception as e:
+            return {
+                'status': 'error',
+                'message': f'Error checking transaction status: {str(e)}'
+            }
+
     def get_blockchain_height(self) -> int:
         """Get current blockchain height - FIXED VERSION"""
         try:
-            # Method 1: Try the blocks endpoint (most reliable)
+            # Get the actual latest block to determine height
             response = requests.get(f'{self.endpoint_url}/blockchain/blocks', timeout=10)
             if response.status_code == 200:
                 data = response.json()
                 blocks = data.get('blocks', [])
                 
-                # Calculate height correctly
                 if blocks:
-                    # Height should be the index of the latest block
-                    latest_block_index = blocks[-1].get('index', len(blocks) - 1)
-                    print(f"📊 Blocks count: {len(blocks)}, Latest block index: {latest_block_index}")
-                    return latest_block_index
-                else:
-                    return 0  # No blocks yet
+                    # The height is the index of the latest block
+                    latest_block = blocks[-1]
+                    latest_index = latest_block.get('index', len(blocks) - 1)
+                    print(f"🔍 Server has {len(blocks)} blocks, latest index: {latest_index}")
+                    print(f"🔍 Latest block hash: {latest_block.get('hash', '')[:32]}...")
+                    return latest_index
+                return 0
                     
-            # If blocks endpoint fails, try height endpoint as fallback
-            response = requests.get(f'{self.endpoint_url}/blockchain/height', timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                height = data.get('height', 0)
-                print(f"📊 Height endpoint returned: {height}")
-                return height
-                
         except Exception as e:
             print(f"Blockchain height error: {e}")
             
-        print("⚠️  Using fallback height: 0")
         return 0
+
+    def get_latest_block(self) -> Optional[Dict]:
+        """Get the actual latest block from server"""
+        try:
+            response = requests.get(f'{self.endpoint_url}/blockchain/blocks', timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                blocks = data.get('blocks', [])
+                if blocks:
+                    return blocks[-1]
+        except Exception as e:
+            print(f"Get latest block error: {e}")
+        return None
     
     def get_block(self, height: int) -> Optional[Dict]:
         """Get block by height"""
@@ -107,23 +243,10 @@ class BlockchainManager:
             
         return []
     
-    def broadcast_transaction(self, transaction: Dict) -> bool:
-        """Broadcast transaction to network"""
-        try:
-            response = requests.post(
-                f'{self.endpoint_url}/mempool/add',
-                json=transaction,
-                timeout=30
-            )
-            return response.status_code == 201
-        except Exception as e:
-            print(f"Broadcast error: {e}")
-            return False
-    
     def check_network_connection(self) -> bool:
         """Check if network is accessible"""
         try:
-            response = requests.get(f'{self.endpoint_url}/health', timeout=5)
+            response = requests.get(f'{self.endpoint_url}/system/health', timeout=5)
             self.network_connected = response.status_code == 200
             return self.network_connected
         except:
@@ -148,6 +271,7 @@ class BlockchainManager:
                 transactions.extend(block_transactions)
                 
         return transactions
+
     def submit_mined_block(self, block_data: Dict) -> bool:
         """Submit a mined block to the network with built-in validation"""
         try:
@@ -279,12 +403,13 @@ class BlockchainManager:
                 'nonce': block_data.get('nonce')
             }
         }
+
     def _find_address_transactions(self, block: Dict, address: str) -> List[Dict]:
-        """Find transactions in block that involve the address"""
+        """Find transactions in block that involve the address - ENHANCED FOR REWARDS"""
         transactions = []
         address_lower = address.lower()
         
-        # Check block reward
+        # Check block reward (miner rewards)
         miner = block.get('miner', '').lower()
         if miner == address_lower:
             reward_tx = {
@@ -295,19 +420,32 @@ class BlockchainManager:
                 'block_height': block.get('index'),
                 'timestamp': block.get('timestamp'),
                 'hash': f"reward_{block.get('index')}_{address}",
-                'status': 'confirmed'
+                'status': 'confirmed',
+                'description': f'Mining reward for block #{block.get("index")}'
             }
             transactions.append(reward_tx)
+            print(f"🎁 Found mining reward: {block.get('reward', 0)} LUN for block #{block.get('index')}")
         
-        # Check regular transactions
+        # Check regular transactions in the block
         for tx in block.get('transactions', []):
+            tx_type = tx.get('type', '').lower()
             from_addr = (tx.get('from') or '').lower()
             to_addr = (tx.get('to') or '').lower()
             
+            # Check if this transaction involves our address
             if from_addr == address_lower or to_addr == address_lower:
                 enhanced_tx = tx.copy()
                 enhanced_tx['block_height'] = block.get('index')
                 enhanced_tx['status'] = 'confirmed'
                 transactions.append(enhanced_tx)
                 
+            # SPECIFICALLY look for reward transactions sent to our address
+            elif tx_type == 'reward' and to_addr == address_lower:
+                enhanced_tx = tx.copy()
+                enhanced_tx['block_height'] = block.get('index')
+                enhanced_tx['status'] = 'confirmed'
+                enhanced_tx['type'] = 'reward'  # Ensure type is set
+                transactions.append(enhanced_tx)
+                print(f"💰 Found reward transaction: {tx.get('amount', 0)} LUN")
+                    
         return transactions
