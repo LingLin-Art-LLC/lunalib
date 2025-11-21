@@ -8,6 +8,7 @@ from .mining.miner import GenesisMiner
 from .gtx.genesis import GTXGenesis
 from .transactions.transactions import TransactionManager
 from .core.blockchain import BlockchainManager
+from .core.mempool import MempoolManager
 
 __version__ = "1.0.0"
 __all__ = [
@@ -15,5 +16,6 @@ __all__ = [
     'GenesisMiner', 
     'GTXGenesis', 
     'TransactionManager',
-    'BlockchainManager'
+    'BlockchainManager',
+    'MempoolManager'
 ]
