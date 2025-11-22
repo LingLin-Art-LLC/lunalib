@@ -8,6 +8,7 @@ from mining.miner import GenesisMiner
 from gtx.genesis import GTXGenesis
 from transactions.transactions import TransactionManager
 from core.blockchain import BlockchainManager
+from core.mempool import MempoolManager
 
 
 class LunaLib:
@@ -19,6 +20,7 @@ class LunaLib:
     GTX = GTXGenesis
     Transaction = TransactionManager
     Blockchain = BlockchainManager
+    Mempool = MempoolManager
     
     @staticmethod
     def get_version():
@@ -33,7 +35,8 @@ class LunaLib:
             'Miner': 'GenesisMiner - Mining operations', 
             'GTX': 'GTXGenesis - GTX token operations',
             'Transaction': 'TransactionManager - Transaction handling',
-            'Blockchain': 'BlockchainManager - Blockchain operations with endpoint support'
+            'Blockchain': 'BlockchainManager - Blockchain operations with endpoint support',
+            'Mempool': 'MempoolManager - Memory Pool management and endpoint'
         }
 
 
@@ -50,6 +53,10 @@ def create_blockchain_manager(endpoint_url="https://bank.linglin.art"):
     """Create a blockchain manager with optional endpoint URL"""
     return BlockchainManager(endpoint_url)
 
+def create_mempool_manager(endpoint_url="https://bank.linglin.art"):
+    """Create a blockchain manager with optional endpoint URL"""
+    return MempoolManager(network_endpoints=[endpoint_url])
+
 def get_transaction_manager():
     """Get transaction manager instance"""
     return TransactionManager()
@@ -63,9 +70,11 @@ __all__ = [
     'GTXGenesis', 
     'TransactionManager',
     'BlockchainManager',
+    'MempoolManager',
     'create_wallet',
     'create_miner',
     'create_blockchain_manager',
+    'create_mempool_manager',
     'get_transaction_manager'
 ]
 
@@ -75,3 +84,4 @@ GenesisMiner = GenesisMiner
 GTXGenesis = GTXGenesis
 TransactionManager = TransactionManager
 BlockchainManager = BlockchainManager
+MempoolManager = MempoolManager
