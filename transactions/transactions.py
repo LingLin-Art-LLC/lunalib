@@ -205,6 +205,7 @@ class TransactionManager:
         self.key_manager = KeyManager()
         self.fee_pool_manager = FeePoolManager()
         self.fee_calculator = FeeCalculator(self.fee_pool_manager)
+        self.pending_by_address = {}  # Track pending transactions by address
     
     def create_transaction(self, from_address: str, to_address: str, amount: float, 
                          private_key: Optional[str] = None, memo: str = "",
@@ -362,6 +363,50 @@ class TransactionManager:
         """Generate unique hash for reward transaction"""
         data = f"reward_{to_address}_{amount}_{block_height}_{time.time()}"
         return hashlib.sha256(data.encode()).hexdigest()
+    
+    def validate_against_available_balance(self, from_address: str, amount: float, 
+                                          available_balance: float) -> Tuple[bool, str]:
+        """Validate that transaction amount doesn't exceed available balance"""
+        pending_amount = self.pending_by_address.get(from_address, 0.0)
+        total_pending = pending_amount + amount
+        
+        if total_pending > available_balance:
+            shortage = total_pending - available_balance
+            return False, f'Insufficient available balance. Need {shortage} more (accounting for {pending_amount} in pending transactions)'
+        
+        return True, 'Sufficient balance'
+    
+    def add_pending_transaction(self, from_address: str, tx_hash: str, amount: float) -> bool:
+        """Track a pending transaction (added to mempool)"""
+        if from_address not in self.pending_by_address:
+            self.pending_by_address[from_address] = 0.0
+        
+        self.pending_by_address[from_address] += float(amount)
+        return True
+    
+    def confirm_transaction(self, from_address: str, amount: float) -> bool:
+        """Confirm a transaction (moved from mempool to blockchain)"""
+        if from_address in self.pending_by_address:
+            pending = self.pending_by_address[from_address]
+            new_pending = max(0.0, pending - float(amount))
+            
+            if new_pending == 0:
+                del self.pending_by_address[from_address]
+            else:
+                self.pending_by_address[from_address] = new_pending
+            
+            return True
+        return False
+    
+    def get_pending_amount(self, from_address: str) -> float:
+        """Get total pending transaction amount for address"""
+        return self.pending_by_address.get(from_address, 0.0)
+    
+    def clear_pending_for_address(self, from_address: str) -> bool:
+        """Clear all pending transactions for address (e.g., if they failed)"""
+        if from_address in self.pending_by_address:
+            del self.pending_by_address[from_address]
+        return True
 
 # Additional validator class for backward compatibility
 class TransactionValidator:

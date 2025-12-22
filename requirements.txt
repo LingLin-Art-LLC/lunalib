@@ -3,6 +3,7 @@ requests>=2.31.0                    # HTTP requests for blockchain API calls
 cryptography>=41.0.0                # Encryption for wallet security
 qrcode[pil]>=7.4.0                  # QR code generation for addresses
 Pillow>=10.0.0                      # Image processing for QR codes
+base58>=2.1.1                       # Base58 encoding for addresses
 
 # Development and testing
 pytest>=7.4.0                       # Test framework
@@ -42,3 +43,5 @@ cupy-cuda12x>=12.0.0
 # cupy-rocm-5-0>=12.0.0
 
 # CPU-only fallback (slower but works everywhere)
+
+sm2

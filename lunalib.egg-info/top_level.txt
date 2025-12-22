@@ -1,1 +1,6 @@
+core
+gtx
 lunalib
+mining
+storage
+transactions

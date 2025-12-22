@@ -28,6 +28,7 @@ class LunaWallet:
         self.encrypted_private_key = None
         self.label = "New Wallet"
         self.is_locked = True
+        self.pending_transactions = {}  # {tx_hash: amount}
 
     def _generate_address(self):
         """Generate wallet address"""
@@ -53,6 +54,7 @@ class LunaWallet:
             'address': self.address,
             'balance': self.balance,
             'available_balance': self.available_balance,
+            'pending_amount': self.get_pending_amount(),
             'created': self.created,
             'private_key': self.private_key,
             'public_key': self.public_key,
@@ -83,7 +85,8 @@ class LunaWallet:
             'public_key': public_key,
             'encrypted_private_key': encrypted_private_key,
             'label': name,
-            'is_locked': True
+            'is_locked': True,
+            'pending_transactions': {}
         }
         
         # CRITICAL: Add to wallets collection
@@ -114,7 +117,8 @@ class LunaWallet:
             'public_key': public_key,
             'encrypted_private_key': encrypted_private_key,
             'label': name,
-            'is_locked': True
+            'is_locked': True,
+            'pending_transactions': {}
         }
         
         # CRITICAL: Add to wallets collection
@@ -131,7 +135,8 @@ class LunaWallet:
         self.current_wallet_address = wallet_data['address']
         self.address = wallet_data['address']
         self.balance = wallet_data['balance']
-        self.available_balance = wallet_data['available_balance']
+        self.pending_transactions = wallet_data.get('pending_transactions', {})
+        self._recalculate_available_balance()
         self.created = wallet_data['created']
         self.private_key = wallet_data['private_key']
         self.public_key = wallet_data['public_key']
@@ -209,6 +214,10 @@ class LunaWallet:
             if not address:
                 return False
                 
+            # Ensure pending_transactions exists
+            if 'pending_transactions' not in wallet_data:
+                wallet_data['pending_transactions'] = {}
+            
             # Add to wallets collection
             self.wallets[address] = wallet_data.copy()
             
@@ -224,7 +233,7 @@ class LunaWallet:
     def update_balance(self, new_balance):
         """Update current wallet balance"""
         self.balance = float(new_balance)
-        self.available_balance = float(new_balance)
+        self._recalculate_available_balance()
         
         # Also update in wallets collection
         if self.current_wallet_address and self.current_wallet_address in self.wallets:
@@ -232,6 +241,51 @@ class LunaWallet:
             self.wallets[self.current_wallet_address]['available_balance'] = self.available_balance
         
         return True
+    
+    def _recalculate_available_balance(self):
+        """Recalculate available balance based on pending transactions"""
+        pending_amount = sum(self.pending_transactions.values())
+        self.available_balance = max(0.0, self.balance - pending_amount)
+    
+    def add_pending_transaction(self, tx_hash: str, amount: float) -> bool:
+        """Add a transaction to pending list (e.g., when sent to mempool)"""
+        if amount > self.available_balance:
+            return False
+        self.pending_transactions[tx_hash] = float(amount)
+        self._recalculate_available_balance()
+        
+        # Update in wallets collection
+        if self.current_wallet_address and self.current_wallet_address in self.wallets:
+            self.wallets[self.current_wallet_address]['pending_transactions'] = self.pending_transactions
+            self.wallets[self.current_wallet_address]['available_balance'] = self.available_balance
+        
+        return True
+    
+    def confirm_pending_transaction(self, tx_hash: str) -> bool:
+        """Confirm a pending transaction (e.g., added to blockchain)"""
+        if tx_hash in self.pending_transactions:
+            del self.pending_transactions[tx_hash]
+            self._recalculate_available_balance()
+            
+            # Update in wallets collection
+            if self.current_wallet_address and self.current_wallet_address in self.wallets:
+                self.wallets[self.current_wallet_address]['pending_transactions'] = self.pending_transactions
+                self.wallets[self.current_wallet_address]['available_balance'] = self.available_balance
+            
+            return True
+        return False
+    
+    def get_pending_amount(self) -> float:
+        """Get total amount in pending transactions"""
+        return sum(self.pending_transactions.values())
+    
+    def get_pending_transactions(self) -> dict:
+        """Get all pending transactions"""
+        return self.pending_transactions.copy()
+    
+    def clear_pending_transaction(self, tx_hash: str) -> bool:
+        """Remove a pending transaction (e.g., if it failed)"""
+        return self.confirm_pending_transaction(tx_hash)
     
     def get_balance(self):
         """Get current wallet balance"""
@@ -289,6 +343,8 @@ class LunaWallet:
                 'address': self.address,
                 'balance': self.balance,
                 'available_balance': self.available_balance,
+                'pending_amount': self.get_pending_amount(),
+                'pending_transactions': self.pending_transactions,
                 'created': self.created,
                 'public_key': self.public_key,
                 'encrypted_private_key': encrypted_key_data,
@@ -320,6 +376,11 @@ class LunaWallet:
             
             # Load wallets collection
             self.wallets = wallet_data.get('wallets', {})
+            
+            # Ensure all wallets have pending_transactions field
+            for addr, w_data in self.wallets.items():
+                if 'pending_transactions' not in w_data:
+                    w_data['pending_transactions'] = {}
             
             # Load current wallet address
             self.current_wallet_address = wallet_data.get('current_wallet_address')

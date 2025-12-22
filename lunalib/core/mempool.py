@@ -20,13 +20,10 @@ class MempoolManager:
         self.broadcast_retries = 3
         self.is_running = True
         
-        # Start background broadcast thread
+        # Start background broadcasting thread
         self.broadcast_thread = threading.Thread(target=self._broadcast_worker, daemon=True)
         self.broadcast_thread.start()
-        
-        # Start cleanup thread
-        self.cleanup_thread = threading.Thread(target=self._cleanup_worker, daemon=True)
-        self.cleanup_thread.start()
+
     
     def add_transaction(self, transaction: Dict) -> bool:
         """Add transaction to local mempool and broadcast to network"""
@@ -198,101 +195,7 @@ class MempoolManager:
         self.local_mempool.clear()
         print("DEBUG: Cleared mempool")
     
-    def _broadcast_worker(self):
-        """Background worker to broadcast pending transactions"""
-        while self.is_running:
-            try:
-                # Test connection first
-                if not self.test_connection():
-                    print("DEBUG: No network connection, waiting...")
-                    time.sleep(30)
-                    continue
-                
-                # Process all pending broadcasts
-                processed_count = 0
-                temporary_queue = Queue()
-                
-                # Move all items to temporary queue to process
-                while not self.pending_broadcasts.empty():
-                    temporary_queue.put(self.pending_broadcasts.get())
-                
-                while not temporary_queue.empty() and processed_count < 10:  # Limit per cycle
-                    transaction = temporary_queue.get()
-                    tx_hash = transaction.get('hash')
-                    
-                    # Skip if already confirmed
-                    if tx_hash in self.confirmed_transactions:
-                        print(f"DEBUG: Transaction {tx_hash} already confirmed, skipping")
-                        continue
-                    
-                    # Update broadcast info
-                    if tx_hash in self.local_mempool:
-                        mempool_data = self.local_mempool[tx_hash]
-                        
-                        # Check if we should stop trying
-                        if mempool_data['broadcast_attempts'] >= self.broadcast_retries:
-                            print(f"DEBUG: Max broadcast attempts reached for {tx_hash}, removing")
-                            del self.local_mempool[tx_hash]
-                            continue
-                        
-                        mempool_data['broadcast_attempts'] += 1
-                        mempool_data['last_broadcast'] = time.time()
-                    
-                    # Broadcast transaction
-                    success = self.broadcast_transaction(transaction)
-                    
-                    if success:
-                        print(f"✅ Broadcast successful for {tx_hash}")
-                        # Transaction is in mempool, we can stop broadcasting it
-                    else:
-                        print(f"❌ Broadcast failed for {tx_hash}, attempt {mempool_data['broadcast_attempts']}")
-                        # Re-queue for retry if under limit
-                        if (tx_hash in self.local_mempool and 
-                            self.local_mempool[tx_hash]['broadcast_attempts'] < self.broadcast_retries):
-                            self.pending_broadcasts.put(transaction)
-                    
-                    processed_count += 1
-                
-                # Sleep before next iteration
-                time.sleep(15)
-                
-            except Exception as e:
-                print(f"DEBUG: Error in broadcast worker: {e}")
-                time.sleep(30)
     
-    def _cleanup_worker(self):
-        """Background worker to clean up old transactions"""
-        while self.is_running:
-            try:
-                current_time = time.time()
-                expired_txs = []
-                
-                # Find transactions older than 1 hour or with too many failed attempts
-                for tx_hash, tx_data in self.local_mempool.items():
-                    transaction_age = current_time - tx_data['timestamp']
-                    if (transaction_age > 3600 or  # 1 hour
-                        tx_data['broadcast_attempts'] >= self.broadcast_retries * 2):
-                        expired_txs.append(tx_hash)
-                        print(f"DEBUG: Marking transaction as expired: {tx_hash}, age: {transaction_age:.0f}s, attempts: {tx_data['broadcast_attempts']}")
-                
-                # Remove expired transactions
-                for tx_hash in expired_txs:
-                    del self.local_mempool[tx_hash]
-                    print(f"DEBUG: Removed expired/failed transaction: {tx_hash}")
-                
-                # Clean up confirmed transactions set (keep only recent ones)
-                if len(self.confirmed_transactions) > self.max_mempool_size * 2:
-                    # Convert to list and keep only recent half
-                    confirmed_list = list(self.confirmed_transactions)
-                    self.confirmed_transactions = set(confirmed_list[-self.max_mempool_size:])
-                    print(f"DEBUG: Cleaned confirmed transactions, now {len(self.confirmed_transactions)} entries")
-                
-                # Sleep for 5 minutes
-                time.sleep(300)
-                
-            except Exception as e:
-                print(f"DEBUG: Error in cleanup worker: {e}")
-                time.sleep(60)
     
     def _validate_transaction_basic(self, transaction: Dict) -> bool:
         """Basic transaction validation"""
@@ -333,6 +236,35 @@ class MempoolManager:
         
         print(f"✅ Transaction validation passed: {transaction.get('type')} from {from_addr} to {to_addr}")
         return True
+    
+    def _broadcast_worker(self):
+        """Background worker to process pending broadcasts"""
+        while self.is_running:
+            try:
+                # Get next transaction to broadcast (blocking)
+                transaction = self.pending_broadcasts.get(timeout=1.0)
+                
+                if transaction:
+                    tx_hash = transaction.get('hash')
+                    print(f"DEBUG: Processing broadcast for transaction: {tx_hash}")
+                    
+                    # Broadcast the transaction
+                    success = self.broadcast_transaction(transaction)
+                    
+                    # Update broadcast attempts in local mempool
+                    if tx_hash in self.local_mempool:
+                        self.local_mempool[tx_hash]['broadcast_attempts'] += 1
+                        self.local_mempool[tx_hash]['last_broadcast'] = time.time()
+                    
+                    # Mark task as done
+                    self.pending_broadcasts.task_done()
+                    
+                    # Small delay between broadcasts
+                    time.sleep(0.5)
+                    
+            except Exception as e:
+                # Queue.get() timed out or other error
+                continue
     
     def stop(self):
         """Stop the mempool manager"""

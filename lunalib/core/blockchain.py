@@ -1,6 +1,6 @@
 # blockchain.py - Updated version
 
-from lunalib.storage.cache import BlockchainCache
+from ..storage.cache import BlockchainCache
 import requests
 import time
 import json
@@ -405,47 +405,206 @@ class BlockchainManager:
         }
 
     def _find_address_transactions(self, block: Dict, address: str) -> List[Dict]:
-        """Find transactions in block that involve the address - ENHANCED FOR REWARDS"""
+        """Find transactions in block that involve the address - FIXED REWARD DETECTION"""
         transactions = []
-        address_lower = address.lower()
+        address_lower = address.lower().strip('"\'')  # Remove quotes if present
         
-        # Check block reward (miner rewards)
-        miner = block.get('miner', '').lower()
-        if miner == address_lower:
-            reward_tx = {
-                'type': 'reward',
-                'from': 'network',
-                'to': address,
-                'amount': block.get('reward', 0),
-                'block_height': block.get('index'),
-                'timestamp': block.get('timestamp'),
-                'hash': f"reward_{block.get('index')}_{address}",
-                'status': 'confirmed',
-                'description': f'Mining reward for block #{block.get("index")}'
-            }
-            transactions.append(reward_tx)
-            print(f"🎁 Found mining reward: {block.get('reward', 0)} LUN for block #{block.get('index')}")
+        print(f"🔍 Scanning block #{block.get('index')} for address: {address}")
+        print(f"   Block data: {block}")
         
-        # Check regular transactions in the block
-        for tx in block.get('transactions', []):
-            tx_type = tx.get('type', '').lower()
-            from_addr = (tx.get('from') or '').lower()
-            to_addr = (tx.get('to') or '').lower()
+        # ==================================================================
+        # 1. CHECK BLOCK MINING REWARD (from block metadata)
+        # ==================================================================
+        miner = block.get('miner', '')
+        # Clean the miner address (remove quotes, trim)
+        miner_clean = str(miner).strip('"\' ')
+        
+        print(f"   Miner in block: '{miner_clean}'")
+        print(f"   Our address: '{address_lower}'")
+        print(f"   Block reward: {block.get('reward', 0)}")
+        
+        # Function to normalize addresses for comparison
+        def normalize_address(addr):
+            if not addr:
+                return ''
+            # Remove LUN_ prefix and quotes, convert to lowercase
+            addr_str = str(addr).strip('"\' ').lower()
+            # Remove 'lun_' prefix if present
+            if addr_str.startswith('lun_'):
+                addr_str = addr_str[4:]
+            return addr_str
+        
+        # Normalize both addresses
+        miner_normalized = normalize_address(miner_clean)
+        address_normalized = normalize_address(address_lower)
+        
+        print(f"   Miner normalized: '{miner_normalized}'")
+        print(f"   Address normalized: '{address_normalized}'")
+        
+        # Check if this block was mined by our address
+        if miner_normalized == address_normalized and miner_normalized:
+            reward_amount = float(block.get('reward', 0))
+            if reward_amount > 0:
+                reward_tx = {
+                    'type': 'reward',
+                    'from': 'network',
+                    'to': address,
+                    'amount': reward_amount,
+                    'block_height': block.get('index'),
+                    'timestamp': block.get('timestamp'),
+                    'hash': f"reward_{block.get('index')}_{block.get('hash', '')[:8]}",
+                    'status': 'confirmed',
+                    'description': f'Mining reward for block #{block.get("index")}',
+                    'direction': 'incoming',
+                    'effective_amount': reward_amount,
+                    'fee': 0
+                }
+                transactions.append(reward_tx)
+                print(f"🎁 FOUND MINING REWARD: {reward_amount} LUN for block #{block.get('index')}")
+                print(f"   Miner match: '{miner_clean}' == '{address}'")
+        else:
+            print(f"   Not our block - Miner: '{miner_clean}', Our address: '{address}'")
+        
+        # ==================================================================
+        # 2. CHECK ALL TRANSACTIONS IN THE BLOCK
+        # ==================================================================
+        block_transactions = block.get('transactions', [])
+        print(f"   Block has {len(block_transactions)} transactions")
+        
+        for tx_index, tx in enumerate(block_transactions):
+            enhanced_tx = tx.copy()
+            enhanced_tx['block_height'] = block.get('index')
+            enhanced_tx['status'] = 'confirmed'
+            enhanced_tx['tx_index'] = tx_index
             
-            # Check if this transaction involves our address
-            if from_addr == address_lower or to_addr == address_lower:
-                enhanced_tx = tx.copy()
-                enhanced_tx['block_height'] = block.get('index')
-                enhanced_tx['status'] = 'confirmed'
-                transactions.append(enhanced_tx)
+            # Get transaction type
+            tx_type = tx.get('type', 'transfer').lower()
+            
+            # Helper function for address matching with normalization
+            def addresses_match(addr1, addr2):
+                if not addr1 or not addr2:
+                    return False
                 
-            # SPECIFICALLY look for reward transactions sent to our address
-            elif tx_type == 'reward' and to_addr == address_lower:
-                enhanced_tx = tx.copy()
-                enhanced_tx['block_height'] = block.get('index')
-                enhanced_tx['status'] = 'confirmed'
-                enhanced_tx['type'] = 'reward'  # Ensure type is set
+                # Normalize both addresses
+                addr1_norm = normalize_address(addr1)
+                addr2_norm = normalize_address(addr2)
+                
+                # Check if they match
+                return addr1_norm == addr2_norm
+            
+            # ==================================================================
+            # A) REWARD TRANSACTIONS (explicit reward transactions)
+            # ==================================================================
+            tx_type = tx.get('type', 'transfer').lower()
+            if tx_type == 'reward':
+                reward_to_address = tx.get('to', '')
+                # Compare the reward's destination with our wallet address
+                if addresses_match(reward_to_address, address):
+                    amount = float(tx.get('amount', 0))
+                    enhanced_tx['direction'] = 'incoming'
+                    enhanced_tx['effective_amount'] = amount
+                    enhanced_tx['fee'] = 0
+                    enhanced_tx.setdefault('from', 'network') # Ensure sender is set
+                    transactions.append(enhanced_tx)
+                    print(f"✅ Found mining reward: {amount} LUN (to: {reward_to_address})")
+                    continue  # Move to next transaction
+            
+            # ==================================================================
+            # B) REGULAR TRANSFERS
+            # ==================================================================
+            from_addr = tx.get('from') or tx.get('sender') or ''
+            to_addr = tx.get('to') or tx.get('receiver') or ''
+            
+            # Check if transaction involves our address
+            is_incoming = addresses_match(to_addr, address)
+            is_outgoing = addresses_match(from_addr, address)
+            
+            if is_incoming:
+                amount = float(tx.get('amount', 0))
+                fee = float(tx.get('fee', 0) or tx.get('gas', 0) or 0)
+                
+                enhanced_tx['direction'] = 'incoming'
+                enhanced_tx['effective_amount'] = amount
+                enhanced_tx['amount'] = amount
+                enhanced_tx['fee'] = fee
+                
                 transactions.append(enhanced_tx)
-                print(f"💰 Found reward transaction: {tx.get('amount', 0)} LUN")
-                    
+                print(f"⬆️ Found incoming transaction: {amount} LUN")
+                
+            elif is_outgoing:
+                amount = float(tx.get('amount', 0))
+                fee = float(tx.get('fee', 0) or tx.get('gas', 0) or 0)
+                
+                enhanced_tx['direction'] = 'outgoing'
+                enhanced_tx['effective_amount'] = -(amount + fee)
+                enhanced_tx['amount'] = amount
+                enhanced_tx['fee'] = fee
+                
+                transactions.append(enhanced_tx)
+                print(f"⬇️ Found outgoing transaction: {amount} LUN + {fee} fee")
+        
+        print(f"📊 Scan complete for block #{block.get('index')}: {len(transactions)} transactions found")
         return transactions
+    def _handle_regular_transfers(self, tx: Dict, address_lower: str) -> Dict:
+        """Handle regular transfer transactions that might be in different formats"""
+        enhanced_tx = tx.copy()
+        
+        # Try to extract addresses from various possible field names
+        possible_from_fields = ['from', 'sender', 'from_address', 'source', 'payer']
+        possible_to_fields = ['to', 'receiver', 'to_address', 'destination', 'payee']
+        possible_amount_fields = ['amount', 'value', 'quantity', 'transfer_amount']
+        possible_fee_fields = ['fee', 'gas', 'transaction_fee', 'gas_fee']
+        
+        # Find from address
+        from_addr = ''
+        for field in possible_from_fields:
+            if field in tx:
+                from_addr = (tx.get(field) or '').lower()
+                break
+        
+        # Find to address
+        to_addr = ''
+        for field in possible_to_fields:
+            if field in tx:
+                to_addr = (tx.get(field) or '').lower()
+                break
+        
+        # Find amount
+        amount = 0
+        for field in possible_amount_fields:
+            if field in tx:
+                amount = float(tx.get(field, 0))
+                break
+        
+        # Find fee
+        fee = 0
+        for field in possible_fee_fields:
+            if field in tx:
+                fee = float(tx.get(field, 0))
+                break
+        
+        # Set direction
+        if from_addr == address_lower:
+            enhanced_tx['direction'] = 'outgoing'
+            enhanced_tx['effective_amount'] = -(amount + fee)
+            enhanced_tx['from'] = from_addr
+            enhanced_tx['to'] = to_addr
+            enhanced_tx['amount'] = amount
+            enhanced_tx['fee'] = fee
+        elif to_addr == address_lower:
+            enhanced_tx['direction'] = 'incoming'
+            enhanced_tx['effective_amount'] = amount
+            enhanced_tx['from'] = from_addr
+            enhanced_tx['to'] = to_addr
+            enhanced_tx['amount'] = amount
+            enhanced_tx['fee'] = fee
+        else:
+            # If we can't determine direction from addresses, check other fields
+            enhanced_tx['direction'] = 'unknown'
+            enhanced_tx['effective_amount'] = amount
+        
+        # Set type if not present
+        if not enhanced_tx.get('type'):
+            enhanced_tx['type'] = 'transfer'
+        
+        return enhanced_tx

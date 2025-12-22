@@ -105,10 +105,10 @@ class GenesisMiner:
             # Calculate block difficulty
             difficulty = self.difficulty_system.get_transaction_block_difficulty(transactions)
             
-            print(f"Mining Transaction Block #{block_height} - Difficulty: {difficulty} zeros")
-            print(f"Transactions: {len(transactions)} | Previous Hash: {previous_hash[:16]}...")
+            print(f"⛏️ Mining Transaction Block #{block_height} - Difficulty: {difficulty} zeros")
+            print(f"📦 Transactions: {len(transactions)} | Previous Hash: {previous_hash[:16]}...")
             
-            # Create block structure
+            # Create block structure for mining
             block_data = {
                 "index": block_height,
                 "previous_hash": previous_hash,
@@ -126,18 +126,35 @@ class GenesisMiner:
             if mining_result["success"]:
                 mining_time = time.time() - start_time
                 
-                # Add mining reward transaction
-                reward_tx = self._create_mining_reward_transaction(miner_address, block_height, transactions)
+                # Add hash and nonce to block_data for validation
+                block_data["hash"] = mining_result["hash"]
+                block_data["nonce"] = mining_result["nonce"]
+                
+                # Create reward transaction WITH VALIDATION
+                reward_tx = self._create_mining_reward_transaction(
+                    miner_address=miner_address,
+                    block_height=block_height,
+                    transactions=transactions,
+                    block_data=block_data  # Pass block data for validation
+                )
+                
+                # Add reward transaction
                 block_data["transactions"].append(reward_tx)
+                
+                # Calculate merkleroot for submission
+                merkleroot = self._calculate_merkleroot(transactions)  # Without reward
                 
                 # Finalize block
                 block = {
                     **block_data,
                     "hash": mining_result["hash"],
                     "nonce": mining_result["nonce"],
+                    "merkleroot": merkleroot,
+                    "transactions_hash": merkleroot,
                     "mining_time": mining_time,
                     "reward": reward_tx["amount"],
-                    "transaction_count": len(block_data["transactions"])
+                    "transaction_count": len(block_data["transactions"]),
+                    "timestamp": block_data["timestamp"]  # Ensure timestamp is included
                 }
                 
                 # Update mining statistics
@@ -145,16 +162,16 @@ class GenesisMiner:
                 self.mining_stats["total_mining_time"] += mining_time
                 self.mining_stats["total_hash_attempts"] += mining_result["nonce"]
                 
-                print(f"Successfully mined Transaction Block #{block_height}!")
-                print(f"Mining time: {mining_time:.2f}s")
-                print(f"Block reward: {block['reward']:.6f} LUN")
-                print(f"Transactions: {block['transaction_count']}")
-                print(f"Block hash: {mining_result['hash'][:32]}...")
+                print(f"✅ Successfully mined and validated Transaction Block #{block_height}!")
+                print(f"⏱️ Mining time: {mining_time:.2f}s")
+                print(f"💰 Block reward: {block['reward']:.6f} LUN")
+                print(f"📊 Transactions: {block['transaction_count']}")
+                print(f"🔗 Block hash: {mining_result['hash'][:32]}...")
                 
                 # Submit block to blockchain
                 submission_success = self.blockchain_manager.submit_mined_block(block)
                 if submission_success:
-                    print("Block successfully submitted to blockchain!")
+                    print("✅ Block successfully submitted to blockchain!")
                     # Clear mined transactions from local mempool
                     self._clear_mined_transactions(transactions)
                 else:
@@ -172,7 +189,7 @@ class GenesisMiner:
                 return {"success": False, "error": "Block mining failed"}
                 
         except Exception as e:
-            print(f"Error mining block: {e}")
+            print(f"❌ Error mining block: {e}")
             import traceback
             traceback.print_exc()
             return {"success": False, "error": str(e)}
@@ -248,18 +265,146 @@ class GenesisMiner:
         """Create GTX Genesis transaction from mined bill"""
         return self.transaction_manager.create_gtx_transaction(bill)
     
-    def _create_mining_reward_transaction(self, miner_address: str, block_height: int, transactions: List[Dict]) -> Dict:
-        """Create mining reward transaction"""
+    def _create_mining_reward_transaction(self, miner_address: str, block_height: int, 
+                                        transactions: List[Dict], block_data: Dict = None) -> Dict:
+        """Create mining reward transaction with validation of the mining proof"""
+        
+        # Calculate reward
         base_reward = 1.0  # Base block reward
         total_fees = sum(tx.get('fee', 0) for tx in transactions)
         total_reward = base_reward + total_fees
         
+        # If block_data is provided, validate the mining proof
+        if block_data:
+            print("🔍 Validating mining proof before creating reward...")
+            
+            # Extract mining proof components
+            block_hash = block_data.get('hash', '')
+            difficulty = block_data.get('difficulty', 0)
+            nonce = block_data.get('nonce', 0)
+            timestamp = block_data.get('timestamp', time.time())
+            previous_hash = block_data.get('previous_hash', '0' * 64)
+            miner = block_data.get('miner', miner_address)
+            
+            # Calculate merkleroot from transactions
+            merkleroot = self._calculate_merkleroot(transactions)
+            
+            print(f"📊 Mining proof components:")
+            print(f"  Block hash: {block_hash[:16]}...")
+            print(f"  Difficulty: {difficulty}")
+            print(f"  Nonce: {nonce}")
+            print(f"  Timestamp: {timestamp}")
+            print(f"  Previous hash: {previous_hash[:16]}...")
+            print(f"  Miner: {miner}")
+            print(f"  Merkleroot: {merkleroot[:16]}...")
+            
+            # Validate difficulty requirement
+            if not block_hash.startswith('0' * difficulty):
+                print(f"❌ FAIL: Hash doesn't start with {difficulty} zeros")
+                raise ValueError(f"Invalid mining proof: Hash doesn't meet difficulty requirement")
+            
+            # Try multiple validation methods
+            validation_passed = False
+            
+            # Method 1: Original format (what server likely expects)
+            original_string = f"{previous_hash}{timestamp}{merkleroot}{miner}{nonce}"
+            original_hash = hashlib.sha256(original_string.encode()).hexdigest()
+            
+            print(f"🔍 Original format validation:")
+            print(f"  String: {original_string[:80]}...")
+            print(f"  Calculated: {original_hash[:16]}...")
+            
+            if original_hash == block_hash:
+                validation_passed = True
+                print("✅ Original format validation passed")
+            
+            # Method 2: JSON format (what miner might be using)
+            if not validation_passed:
+                mining_json = {
+                    "index": block_height,
+                    "previous_hash": previous_hash,
+                    "timestamp": timestamp,
+                    "transactions": transactions,
+                    "miner": miner,
+                    "difficulty": difficulty,
+                    "nonce": nonce,
+                    "version": "1.0"
+                }
+                
+                json_string = json.dumps(mining_json, sort_keys=True)
+                json_hash = hashlib.sha256(json_string.encode()).hexdigest()
+                
+                print(f"🔍 JSON format validation:")
+                print(f"  String: {json_string[:100]}...")
+                print(f"  Calculated: {json_hash[:16]}...")
+                
+                if json_hash == block_hash:
+                    validation_passed = True
+                    print("✅ JSON format validation passed")
+            
+            # Method 3: JSON without transactions (for empty blocks)
+            if not validation_passed and len(transactions) == 0:
+                mining_json_empty = {
+                    "index": block_height,
+                    "previous_hash": previous_hash,
+                    "timestamp": timestamp,
+                    "transactions": [],
+                    "miner": miner,
+                    "difficulty": difficulty,
+                    "nonce": nonce,
+                    "version": "1.0"
+                }
+                
+                json_string_empty = json.dumps(mining_json_empty, sort_keys=True)
+                json_hash_empty = hashlib.sha256(json_string_empty.encode()).hexdigest()
+                
+                print(f"🔍 JSON empty format validation:")
+                print(f"  Calculated: {json_hash_empty[:16]}...")
+                
+                if json_hash_empty == block_hash:
+                    validation_passed = True
+                    print("✅ JSON empty format validation passed")
+            
+            if not validation_passed:
+                print("❌ All validation methods failed")
+                raise ValueError("Invalid mining proof: Hash verification failed")
+            
+            print("✅ Mining proof validation successful!")
+        
+        # Create the reward transaction
         return self.transaction_manager.create_reward_transaction(
             to_address=miner_address,
             amount=total_reward,
             block_height=block_height,
             reward_type="block"
         )
+
+    def _calculate_merkleroot(self, transactions: List[Dict]) -> str:
+        """Calculate merkle root from transactions"""
+        if not transactions:
+            return "0" * 64
+        
+        tx_hashes = []
+        for tx in transactions:
+            if 'hash' in tx:
+                tx_hashes.append(tx['hash'])
+            else:
+                tx_string = json.dumps(tx, sort_keys=True)
+                tx_hashes.append(hashlib.sha256(tx_string.encode()).hexdigest())
+        
+        # Simple merkle root calculation
+        while len(tx_hashes) > 1:
+            new_hashes = []
+            for i in range(0, len(tx_hashes), 2):
+                if i + 1 < len(tx_hashes):
+                    combined = tx_hashes[i] + tx_hashes[i + 1]
+                else:
+                    combined = tx_hashes[i] + tx_hashes[i]
+                new_hash = hashlib.sha256(combined.encode()).hexdigest()
+                new_hashes.append(new_hash)
+            tx_hashes = new_hashes
+        
+        return tx_hashes[0] if tx_hashes else "0" * 64
     
     def _clear_mined_transactions(self, mined_transactions: List[Dict]):
         """Remove mined transactions from local mempool"""
