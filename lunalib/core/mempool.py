@@ -24,6 +24,16 @@ class MempoolManager:
         self.broadcast_thread = threading.Thread(target=self._broadcast_worker, daemon=True)
         self.broadcast_thread.start()
 
+    # ----------------------
+    # Address normalization
+    # ----------------------
+    def _normalize_address(self, addr: str) -> str:
+        """Normalize addresses (lowercase, strip, drop LUN_)."""
+        if not addr:
+            return ''
+        addr_str = str(addr).strip("'\" ").lower()
+        return addr_str[4:] if addr_str.startswith('lun_') else addr_str
+
     
     def add_transaction(self, transaction: Dict) -> bool:
         """Add transaction to local mempool and broadcast to network"""
@@ -162,32 +172,72 @@ class MempoolManager:
             return self.local_mempool[tx_hash]['transaction']
         return None
     
-    def get_pending_transactions(self, address: str = None) -> List[Dict]:
-        """Get all pending transactions, optionally filtered by address"""
+    def _maybe_fetch_remote_mempool(self):
+        """Fetch mempool from remote endpoints and merge into local cache."""
+        for endpoint in self.network_endpoints:
+            try:
+                resp = requests.get(f"{endpoint}/mempool", timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, list):
+                        for tx in data:
+                            tx_hash = tx.get('hash')
+                            if tx_hash and tx_hash not in self.local_mempool and tx_hash not in self.confirmed_transactions:
+                                self.local_mempool[tx_hash] = {
+                                    'transaction': tx,
+                                    'timestamp': time.time(),
+                                    'broadcast_attempts': 0,
+                                    'last_broadcast': 0
+                                }
+                else:
+                    print(f"DEBUG: Remote mempool fetch HTTP {resp.status_code}: {resp.text}")
+            except Exception as e:
+                print(f"DEBUG: Remote mempool fetch error from {endpoint}: {e}")
+
+    def get_pending_transactions(self, address: str = None, fetch_remote: bool = True) -> List[Dict]:
+        """Get all pending transactions, optionally filtered by address; can fetch remote first."""
+        if fetch_remote:
+            self._maybe_fetch_remote_mempool()
+
+        target_norm = self._normalize_address(address) if address else None
         transactions = []
         for tx_data in self.local_mempool.values():
             tx = tx_data['transaction']
-            if address is None or tx.get('from') == address or tx.get('to') == address:
+            if address is None:
+                transactions.append(tx)
+                continue
+
+            from_norm = self._normalize_address(tx.get('from') or tx.get('sender'))
+            to_norm = self._normalize_address(tx.get('to') or tx.get('receiver'))
+            if target_norm and (from_norm == target_norm or to_norm == target_norm):
                 transactions.append(tx)
         return transactions
 
-    def get_pending_transactions_for_addresses(self, addresses: List[str]) -> Dict[str, List[Dict]]:
-        """Get pending transactions mapped per address in one pass."""
+    def get_pending_transactions_for_addresses(self, addresses: List[str], fetch_remote: bool = True) -> Dict[str, List[Dict]]:
+        """Get pending transactions mapped per address in one pass; can fetch remote first."""
         if not addresses:
             return {}
 
-        address_set = set(addresses)
+        if fetch_remote:
+            self._maybe_fetch_remote_mempool()
+
+        norm_to_original: Dict[str, str] = {}
+        for addr in addresses:
+            norm = self._normalize_address(addr)
+            if norm:
+                norm_to_original[norm] = addr
+
         results: Dict[str, List[Dict]] = {addr: [] for addr in addresses}
 
         for tx_data in self.local_mempool.values():
             tx = tx_data['transaction']
-            from_addr = tx.get('from') or tx.get('sender')
-            to_addr = tx.get('to') or tx.get('receiver')
+            from_norm = self._normalize_address(tx.get('from') or tx.get('sender'))
+            to_norm = self._normalize_address(tx.get('to') or tx.get('receiver'))
 
-            if from_addr in address_set:
-                results[from_addr].append(tx)
-            if to_addr in address_set:
-                results[to_addr].append(tx)
+            if from_norm in norm_to_original:
+                results[norm_to_original[from_norm]].append(tx)
+            if to_norm in norm_to_original:
+                results[norm_to_original[to_norm]].append(tx)
 
         return {addr: txs for addr, txs in results.items() if txs}
     

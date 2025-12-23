@@ -28,6 +28,15 @@ class LunaWallet:
         self._reset_current_wallet()
         self._confirmed_tx_cache: Dict[str, List[Dict]] = {}
         self._pending_tx_cache: Dict[str, List[Dict]] = {}
+
+    # ----------------------
+    # Address normalization
+    # ----------------------
+    def _normalize_address(self, addr: str) -> str:
+        if not addr:
+            return ''
+        addr_str = str(addr).strip("'\" ").lower()
+        return addr_str[4:] if addr_str.startswith('lun_') else addr_str
         
         
     def _reset_current_wallet(self):
@@ -292,12 +301,16 @@ class LunaWallet:
         pending_out = 0.0
         pending_in = 0.0
 
+        target_norm = self._normalize_address(address)
         for tx in pending_txs:
-            if tx.get('from') == address:
+            from_norm = self._normalize_address(tx.get('from') or tx.get('sender'))
+            to_norm = self._normalize_address(tx.get('to') or tx.get('receiver'))
+
+            if from_norm == target_norm:
                 amount = float(tx.get('amount', 0) or 0)
                 fee = float(tx.get('fee', 0) or tx.get('gas', 0) or 0)
                 pending_out += amount + fee
-            if tx.get('to') == address:
+            if to_norm == target_norm:
                 amount = float(tx.get('amount', 0) or 0)
                 pending_in += amount
 
@@ -311,7 +324,7 @@ class LunaWallet:
             confirmed = self._confirmed_tx_cache.get(addr, [])
             pending = self._pending_tx_cache.get(addr, [])
 
-            total_balance = self._compute_confirmed_balance(confirmed)
+            total_balance = max(0.0, self._compute_confirmed_balance(confirmed))
             pending_out, pending_in = self._compute_pending_totals(pending, addr)
             available_balance = max(0.0, total_balance - pending_out)
 
@@ -345,7 +358,7 @@ class LunaWallet:
             mempool = MempoolManager()
 
             confirmed_map = blockchain.scan_transactions_for_addresses(addresses)
-            pending_map = mempool.get_pending_transactions_for_addresses(addresses)
+            pending_map = mempool.get_pending_transactions_for_addresses(addresses, fetch_remote=True)
 
             # Reset caches with the latest snapshots
             self._confirmed_tx_cache = confirmed_map
@@ -360,6 +373,26 @@ class LunaWallet:
     def sync_all_wallets_once(self) -> Dict[str, Dict[str, float]]:
         """Convenience: scan blockchain once and mempool once, update all wallet balances."""
         return self.refresh_all_wallet_balances()
+
+    def get_all_wallets_overview(self, include_transactions: bool = True) -> Dict[str, Dict]:
+        """Return balances and (optionally) cached transactions for all wallets."""
+        overview: Dict[str, Dict] = {}
+        for addr, wallet_data in self.wallets.items():
+            confirmed = self._confirmed_tx_cache.get(addr, [])
+            pending = self._pending_tx_cache.get(addr, [])
+
+            overview[addr] = {
+                'balance': wallet_data.get('balance', 0.0),
+                'available_balance': wallet_data.get('available_balance', 0.0),
+                'pending_out': self._compute_pending_totals(pending, addr)[0],
+                'pending_in': self._compute_pending_totals(pending, addr)[1],
+            }
+
+            if include_transactions:
+                overview[addr]['confirmed_transactions'] = confirmed
+                overview[addr]['pending_transactions'] = pending
+
+        return overview
 
     def _apply_transaction_updates(self, confirmed_map: Dict[str, List[Dict]], pending_map: Dict[str, List[Dict]]):
         """Update caches from monitor callbacks and recompute balances."""
@@ -402,6 +435,11 @@ class LunaWallet:
         """Run a one-time sync (blockchain + mempool) then start live monitoring."""
         self.sync_all_wallets_once()
         return self.start_wallet_monitoring(poll_interval=poll_interval)
+
+    def get_all_balances_after_sync(self, include_transactions: bool = True) -> Dict[str, Dict]:
+        """One-shot sync then return per-wallet balances (and transactions if requested)."""
+        self.sync_all_wallets_once()
+        return self.get_all_wallets_overview(include_transactions=include_transactions)
     def _get_pending_balance(self) -> float:
         """Get total pending balance from mempool (outgoing pending transactions)"""
         try:
@@ -410,7 +448,7 @@ class LunaWallet:
             mempool = MempoolManager()
             
             # Get pending transactions for this address
-            pending_txs = mempool.get_pending_transactions(self.address)
+            pending_txs = mempool.get_pending_transactions(self.address, fetch_remote=True)
             
             total_pending_outgoing = 0.0
             
@@ -436,7 +474,7 @@ class LunaWallet:
             mempool = MempoolManager()
             
             # Get pending transactions for this address
-            pending_txs = mempool.get_pending_transactions(self.address)
+            pending_txs = mempool.get_pending_transactions(self.address, fetch_remote=True)
             
             total_pending_incoming = 0.0
             
