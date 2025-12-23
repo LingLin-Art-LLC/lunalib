@@ -357,6 +357,10 @@ class LunaWallet:
             print(f"DEBUG: Error refreshing all wallet balances: {e}")
             return {}
 
+    def sync_all_wallets_once(self) -> Dict[str, Dict[str, float]]:
+        """Convenience: scan blockchain once and mempool once, update all wallet balances."""
+        return self.refresh_all_wallet_balances()
+
     def _apply_transaction_updates(self, confirmed_map: Dict[str, List[Dict]], pending_map: Dict[str, List[Dict]]):
         """Update caches from monitor callbacks and recompute balances."""
         for addr, txs in confirmed_map.items():
@@ -393,6 +397,11 @@ class LunaWallet:
         stop_event = getattr(self, '_monitor_stop_event', None)
         if stop_event:
             stop_event.set()
+
+    def start_sync_and_monitor(self, poll_interval: int = 15):
+        """Run a one-time sync (blockchain + mempool) then start live monitoring."""
+        self.sync_all_wallets_once()
+        return self.start_wallet_monitoring(poll_interval=poll_interval)
     def _get_pending_balance(self) -> float:
         """Get total pending balance from mempool (outgoing pending transactions)"""
         try:
