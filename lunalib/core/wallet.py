@@ -751,29 +751,137 @@ class LunaWallet:
             print(f"[WALLET ERROR] Failed to initialize SM2: {e}")
         return False
     def get_transaction_history(self) -> dict:
-        """Get complete transaction history (both pending and confirmed)"""
+        """Get complete transaction history (both pending and confirmed).
+        Uses cached transactions if available, otherwise scans blockchain/mempool.
+        Includes ALL reward transactions (mining rewards and explicit reward txs).
+        """
         try:
-            from lunalib.core.blockchain import BlockchainManager
-            from lunalib.core.mempool import MempoolManager
+            # Try to use cache first (from monitoring or sync)
+            confirmed_txs = self._confirmed_tx_cache.get(self.address, [])
+            pending_txs = self._pending_tx_cache.get(self.address, [])
             
-            blockchain = BlockchainManager()
-            mempool = MempoolManager()
+            # If cache is empty, perform fresh scan
+            if not confirmed_txs:
+                from lunalib.core.blockchain import BlockchainManager
+                from lunalib.core.mempool import MempoolManager
+                
+                blockchain = BlockchainManager()
+                mempool = MempoolManager()
+                
+                # Get confirmed transactions from blockchain (includes mining rewards)
+                confirmed_txs = blockchain.scan_transactions_for_address(self.address)
+                self._confirmed_tx_cache[self.address] = confirmed_txs
+                
+                # Get pending transactions from mempool
+                pending_txs = mempool.get_pending_transactions(self.address, fetch_remote=True)
+                self._pending_tx_cache[self.address] = pending_txs
             
-            # Get confirmed transactions from blockchain
-            confirmed_txs = blockchain.scan_transactions_for_address(self.address)
-            
-            # Get pending transactions from mempool
-            pending_txs = mempool.get_pending_transactions(self.address)
+            # Count by type for debugging
+            reward_count = sum(1 for tx in confirmed_txs 
+                             if tx.get('type', '').lower() in ['reward', 'mining'] 
+                             or tx.get('from') == 'network')
             
             return {
                 'confirmed': confirmed_txs,
                 'pending': pending_txs,
                 'total_confirmed': len(confirmed_txs),
-                'total_pending': len(pending_txs)
+                'total_pending': len(pending_txs),
+                'reward_count': reward_count
             }
         except Exception as e:
             print(f"DEBUG: Error getting transaction history: {e}")
-            return {'confirmed': [], 'pending': [], 'total_confirmed': 0, 'total_pending': 0}
+            return {'confirmed': [], 'pending': [], 'total_confirmed': 0, 'total_pending': 0, 'reward_count': 0}
+    
+    def get_wallet_transactions(self, address: str = None, include_pending: bool = True) -> Dict[str, List[Dict]]:
+        """Get ALL transactions for a wallet including mining rewards, transfers, and pending.
+        
+        This is the comprehensive transaction getter that ensures ALL reward transactions
+        (mining rewards, explicit reward transactions) are included.
+        
+        Args:
+            address: wallet address to query (defaults to current wallet address)
+            include_pending: whether to include pending mempool transactions (default: True)
+            
+        Returns:
+            Dict with:
+                - 'confirmed': list of all confirmed transactions (transfers + mining rewards)
+                - 'pending': list of pending mempool transactions
+                - 'reward_transactions': list of only reward/mining transactions
+                - 'transfer_transactions': list of only transfer transactions
+                - 'total_rewards': count of reward transactions
+                - 'total_transfers': count of transfer transactions
+        """
+        if address is None:
+            address = self.address
+        
+        if not address:
+            return {
+                'confirmed': [],
+                'pending': [],
+                'reward_transactions': [],
+                'transfer_transactions': [],
+                'total_rewards': 0,
+                'total_transfers': 0
+            }
+        
+        try:
+            # Normalize address for comparison
+            norm_addr = self._normalize_address(address)
+            
+            # Use cache if available
+            confirmed_txs = self._confirmed_tx_cache.get(norm_addr, [])
+            pending_txs = self._pending_tx_cache.get(norm_addr, []) if include_pending else []
+            
+            # If cache is empty, perform fresh scan
+            if not confirmed_txs:
+                from lunalib.core.blockchain import BlockchainManager
+                blockchain = BlockchainManager()
+                confirmed_txs = blockchain.scan_transactions_for_address(address)
+                self._confirmed_tx_cache[norm_addr] = confirmed_txs
+            
+            if include_pending and not pending_txs:
+                from lunalib.core.mempool import MempoolManager
+                mempool = MempoolManager()
+                pending_txs = mempool.get_pending_transactions(address, fetch_remote=True)
+                self._pending_tx_cache[norm_addr] = pending_txs
+            
+            # Separate rewards and transfers
+            reward_txs = [tx for tx in confirmed_txs 
+                         if tx.get('type', '').lower() in ['reward', 'mining'] 
+                         or tx.get('from') == 'network']
+            transfer_txs = [tx for tx in confirmed_txs 
+                           if tx.get('type', '').lower() not in ['reward', 'mining'] 
+                           and tx.get('from') != 'network']
+            
+            result = {
+                'confirmed': confirmed_txs,
+                'pending': pending_txs,
+                'reward_transactions': reward_txs,
+                'transfer_transactions': transfer_txs,
+                'total_rewards': len(reward_txs),
+                'total_transfers': len(transfer_txs)
+            }
+            
+            print(f"DEBUG: get_wallet_transactions({address}):")
+            print(f"  - Mining Rewards: {len(reward_txs)}")
+            print(f"  - Transfers: {len(transfer_txs)}")
+            print(f"  - Pending: {len(pending_txs)}")
+            print(f"  - Total Confirmed: {len(confirmed_txs)}")
+            
+            return result
+            
+        except Exception as e:
+            print(f"DEBUG: Error getting wallet transactions: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                'confirmed': [],
+                'pending': [],
+                'reward_transactions': [],
+                'transfer_transactions': [],
+                'total_rewards': 0,
+                'total_transfers': 0
+            }
     
     # ============================================================================
     # WALLET INFO AND UTILITIES
