@@ -1,5 +1,6 @@
 import time
 import sys
+import os
 from lunalib.utils.console import print_info, print_warn, print_error, print_success, print_debug
 
 # --- Unicode-safe print for Windows console ---
@@ -18,6 +19,7 @@ import hashlib
 import json
 from typing import Dict, Optional, Tuple, List
 from ..core.mempool import MempoolManager
+from .validator import TransactionValidator
 
 # Import REAL SM2 KeyManager from crypto module
 try:
@@ -80,6 +82,7 @@ class TransactionManager:
         self.security = TransactionSecurity()
         self.fee_calculator = FeeCalculator()
         self.mempool_manager = MempoolManager(network_endpoints)
+        self.verbose = bool(int(os.getenv("LUNALIB_DEBUG", "0")))
         
         # Initialize SM2 KeyManager if available
         if SM2_AVAILABLE:
@@ -102,6 +105,7 @@ class TransactionManager:
             "to": to_address,
             "amount": float(amount),
             "fee": fee,
+            "nonce": int(time.time() * 1000),
             "timestamp": int(time.time()),
             "memo": memo,
             "version": "2.0"  # Version 2.0 = SM2 signatures
@@ -112,34 +116,40 @@ class TransactionManager:
             try:
                 # Sign the transaction data
                 tx_string = self._get_signing_data(transaction)
+                transaction["_signing_data"] = tx_string
+                transaction["_signing_hash"] = hashlib.sha256(tx_string.encode()).hexdigest()
                 
-                safe_print(f"[TRANSACTIONS CREATE DEBUG] Signing data: {tx_string}")
-                safe_print(f"[TRANSACTIONS CREATE DEBUG] Private key available: {bool(private_key)}")
-                safe_print(f"[TRANSACTIONS CREATE DEBUG] Private key length: {len(private_key)}")
+                if self.verbose:
+                    safe_print(f"[TRANSACTIONS CREATE DEBUG] Signing data: {tx_string}")
+                    safe_print(f"[TRANSACTIONS CREATE DEBUG] Private key available: {bool(private_key)}")
+                    safe_print(f"[TRANSACTIONS CREATE DEBUG] Private key length: {len(private_key)}")
                 
                 signature = self.key_manager.sign_data(tx_string, private_key)
                 
                 # Get public key from private key
                 public_key = self.key_manager.derive_public_key(private_key)
                 
-                safe_print(f"[TRANSACTIONS CREATE DEBUG] Generated signature: {signature}")
-                safe_print(f"[TRANSACTIONS CREATE DEBUG] Generated public key: {public_key}")
-                safe_print(f"[TRANSACTIONS CREATE DEBUG] Signature length: {len(signature)}")
-                safe_print(f"[TRANSACTIONS CREATE DEBUG] Public key length: {len(public_key)}")
+                if self.verbose:
+                    safe_print(f"[TRANSACTIONS CREATE DEBUG] Generated signature: {signature}")
+                    safe_print(f"[TRANSACTIONS CREATE DEBUG] Generated public key: {public_key}")
+                    safe_print(f"[TRANSACTIONS CREATE DEBUG] Signature length: {len(signature)}")
+                    safe_print(f"[TRANSACTIONS CREATE DEBUG] Public key length: {len(public_key)}")
                 
                 transaction["signature"] = signature
                 transaction["public_key"] = public_key
                 
-                # Immediately test verification
-                test_verify = self.key_manager.verify_signature(tx_string, signature, public_key)
-                safe_print(f"[TRANSACTIONS CREATE DEBUG] Immediate self-verification: {test_verify}")
-                
-                if not test_verify:
-                    safe_print(f"[TRANSACTIONS CREATE ERROR] Signature doesn't verify immediately!")
-                    safe_print(f"[TRANSACTIONS CREATE ERROR] This suggests an SM2 implementation issue")
+                # Optionally test verification (can be expensive)
+                if self.verbose or bool(int(os.getenv("LUNALIB_TX_SELF_VERIFY", "0"))):
+                    test_verify = self.key_manager.verify_signature(tx_string, signature, public_key)
+                    if self.verbose:
+                        safe_print(f"[TRANSACTIONS CREATE DEBUG] Immediate self-verification: {test_verify}")
+                    if not test_verify and self.verbose:
+                        safe_print(f"[TRANSACTIONS CREATE ERROR] Signature doesn't verify immediately!")
+                        safe_print(f"[TRANSACTIONS CREATE ERROR] This suggests an SM2 implementation issue")
                     
             except Exception as e:
-                safe_print(f"[TRANSACTIONS CREATE ERROR] Signing failed: {e}")
+                if self.verbose:
+                    safe_print(f"[TRANSACTIONS CREATE ERROR] Signing failed: {e}")
                 import traceback
                 traceback.print_exc()
                 transaction["signature"] = "unsigned"
@@ -162,10 +172,7 @@ class TransactionManager:
             if not is_valid:
                 return False, f"Validation failed: {message}"
             
-            # Verify signature for non-system transactions
-            if transaction["type"] == "transfer":
-                if not self.verify_transaction_signature(transaction):
-                    return False, "Invalid transaction signature"
+            # Signature is validated inside validate_transaction (TransactionSecurity)
             
             # Add to mempool
             success = self.mempool_manager.add_transaction(transaction)
@@ -240,35 +247,45 @@ class TransactionManager:
             
             # System transactions are always valid
             if signature in ["system", "unsigned", "test"]:
-                safe_print(f"[TRANSACTIONS] Skipping signature check for {signature} transaction")
+                if self.verbose:
+                    safe_print(f"[TRANSACTIONS] Skipping signature check for {signature} transaction")
                 return True
             
             if not self.key_manager:
-                safe_print("[TRANSACTIONS] No key manager available for verification")
+                if self.verbose:
+                    safe_print("[TRANSACTIONS] No key manager available for verification")
                 return False
             
             # Check SM2 signature format
             if len(signature) != 128:
-                safe_print(f"[TRANSACTIONS] Invalid SM2 signature length: {len(signature)} (expected 128)")
+                if self.verbose:
+                    safe_print(f"[TRANSACTIONS] Invalid SM2 signature length: {len(signature)} (expected 128)")
                 return False
             
             # Get signing data (without public_key!)
-            sign_data = self._get_signing_data(transaction)
+            sign_data = transaction.get("_signing_data") or self._get_signing_data(transaction)
+            if "_signing_data" not in transaction:
+                transaction["_signing_data"] = sign_data
+                transaction["_signing_hash"] = hashlib.sha256(sign_data.encode()).hexdigest()
             public_key = transaction.get("public_key", "")
             
-            safe_print(f"[TRANSACTIONS VERIFY] Signing data length: {len(sign_data)}")
-            safe_print(f"[TRANSACTIONS VERIFY] Signing data (first 100 chars): {sign_data[:100]}")
+            if self.verbose:
+                safe_print(f"[TRANSACTIONS VERIFY] Signing data length: {len(sign_data)}")
+                safe_print(f"[TRANSACTIONS VERIFY] Signing data (first 100 chars): {sign_data[:100]}")
             
             # Try to verify with KeyManager
-            safe_print(f"[TRANSACTIONS] Attempting verification...")
+            if self.verbose:
+                safe_print(f"[TRANSACTIONS] Attempting verification...")
             is_valid = self.key_manager.verify_signature(sign_data, signature, public_key)
             
-            safe_print(f"[TRANSACTIONS] SM2 signature verification result: {is_valid}")
+            if self.verbose:
+                safe_print(f"[TRANSACTIONS] SM2 signature verification result: {is_valid}")
             
             return is_valid
             
         except Exception as e:
-            safe_print(f"[TRANSACTIONS] Verification error: {e}")
+            if self.verbose:
+                safe_print(f"[TRANSACTIONS] Verification error: {e}")
             import traceback
             traceback.print_exc()
             return False

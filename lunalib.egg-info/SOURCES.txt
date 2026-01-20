@@ -20,6 +20,7 @@ lunalib/core/__init__.py
 lunalib/core/blockchain.py
 lunalib/core/crypto.py
 lunalib/core/daemon.py
+lunalib/core/daemon_server.py
 lunalib/core/mempool.py
 lunalib/core/p2p.py
 lunalib/core/sm2.py

@@ -118,6 +118,14 @@ class LunaWallet:
         self._reset_current_wallet()
         self._confirmed_tx_cache: Dict[str, List[Dict]] = {}
         self._pending_tx_cache: Dict[str, List[Dict]] = {}
+        self._ui_callbacks: List[Callable] = []
+        self._ui_event_callbacks: List[Callable] = []
+        self._ui_debounce = float(os.getenv("LUNALIB_UI_DEBOUNCE", "0.25"))
+        self._ui_pending_payload: Dict[str, Dict] = {}
+        self._ui_pending_events: Dict[str, Dict] = {}
+        self._ui_timer: Optional[threading.Timer] = None
+        self._ui_handler_registered = False
+        self._ui_event_handler_registered = False
         self._load_wallets_from_db()
 
     def _load_wallets_from_db(self):
@@ -230,30 +238,45 @@ class LunaWallet:
             return {"success": False, "error": f"Failed to get balance: {e}"}
 
     def get_wallet_transaction_history(self, address=None):
-        """Get confirmed and pending transactions for a wallet."""
+        """Get confirmed and pending transactions for a wallet (includes rewards)."""
         addr = address or self.current_wallet_address
         if not addr:
             return {"success": False, "error": "No wallet selected"}
-        confirmed = self._confirmed_tx_cache.get(addr, [])
-        pending = self._pending_tx_cache.get(addr, [])
+
+        norm_addr = self._normalize_address(addr)
+
+        confirmed = self._confirmed_tx_cache.get(norm_addr, [])
+        pending = self._pending_tx_cache.get(norm_addr, [])
+
         if not confirmed:
             from lunalib.core.blockchain import BlockchainManager
 
             blockchain = BlockchainManager()
             confirmed = blockchain.scan_transactions_for_address(addr)
-            self._confirmed_tx_cache[addr] = confirmed
+            self._confirmed_tx_cache[norm_addr] = confirmed
+
         if not pending:
             from lunalib.core.mempool import MempoolManager
 
             mempool = MempoolManager()
             pending = mempool.get_pending_transactions(addr, fetch_remote=True)
-            self._pending_tx_cache[addr] = pending
+            self._pending_tx_cache[norm_addr] = pending
+
+        reward_txs = [
+            tx
+            for tx in confirmed
+            if tx.get("type", "").lower() in ["reward", "mining", "gtx_genesis"]
+            or tx.get("from") == "network"
+        ]
+
         return {
             "address": addr,
             "confirmed": confirmed,
             "pending": pending,
+            "reward_transactions": reward_txs,
             "total_confirmed": len(confirmed),
             "total_pending": len(pending),
+            "total_rewards": len(reward_txs),
         }
 
     def __init__(self, data_dir=None):
@@ -961,6 +984,26 @@ class LunaWallet:
             if success:
                 print(f"[SM2] Transaction broadcast: {message}")
 
+                # Add to local pending cache + history immediately
+                pending_tx = transaction.copy()
+                pending_tx["status"] = "pending"
+                pending_tx["direction"] = "outgoing"
+                pending_tx["effective_amount"] = -(
+                    float(transaction.get("amount", 0)) + float(transaction.get("fee", 0) or 0)
+                )
+                addr = self.current_wallet_address or self.address
+                if addr:
+                    pending_list = self._pending_tx_cache.get(addr, [])
+                    # Avoid duplicates by hash
+                    tx_hash = pending_tx.get("hash")
+                    if not any(t.get("hash") == tx_hash for t in pending_list):
+                        pending_list.append(pending_tx)
+                        self._pending_tx_cache[addr] = pending_list
+
+                if hasattr(self, "transactions") and isinstance(self.transactions, list):
+                    if not any(t.get("hash") == pending_tx.get("hash") for t in self.transactions):
+                        self.transactions.append(pending_tx)
+
                 # Update balance immediately
                 total_cost = amount + transaction.get("fee", 0)
                 self.available_balance -= total_cost
@@ -971,6 +1014,12 @@ class LunaWallet:
 
                 # Save state
                 self.save_wallet_data()
+
+                # Recompute balances using pending cache
+                try:
+                    self.calculate_available_balance()
+                except Exception:
+                    pass
 
                 # Trigger async balance refresh to get accurate data
                 self.start_async_balance_loading()
@@ -1426,11 +1475,19 @@ class LunaWallet:
             print(f"🔄 Syncing {len(addresses)} wallets...")
 
             # Get data from blockchain and mempool (single scan)
-            blockchain_txs = blockchain.scan_transactions_for_addresses(addresses)
+            end_height = blockchain.get_blockchain_height()
+            if end_height <= state_manager.last_blockchain_height:
+                blockchain_txs = {}
+            else:
+                start_height = max(0, state_manager.last_blockchain_height + 1)
+                blockchain_txs = blockchain.scan_transactions_for_addresses(
+                    addresses, start_height=start_height, end_height=end_height
+                )
             mempool_txs = mempool.get_pending_transactions_for_addresses(addresses)
 
             # Sync state manager with the data
             state_manager.sync_wallets_from_sources(blockchain_txs, mempool_txs)
+            state_manager.last_blockchain_height = end_height
 
             # Update LunaWallet balances from state manager
             balances = state_manager.get_all_balances()
@@ -1531,9 +1588,96 @@ class LunaWallet:
             from .wallet_manager import get_wallet_manager
 
             state_manager = get_wallet_manager()
-            state_manager.on_balance_update(callback)
+            self._ui_callbacks.append(callback)
+
+            if not self._ui_handler_registered:
+                def _ui_handler(balance_data: Dict):
+                    self._queue_ui_update(balance_data)
+
+                state_manager.on_balance_update(_ui_handler)
+                self._ui_handler_registered = True
         except Exception as e:
             print(f"⚠️  Error registering callback: {e}")
+
+    def register_wallet_event_callback(self, callback: Callable) -> None:
+        """
+        Register a callback to receive change-only transaction events.
+        Callback will be called with: callback(event_data_dict)
+        """
+        try:
+            from .wallet_manager import get_wallet_manager
+
+            state_manager = get_wallet_manager()
+            self._ui_event_callbacks.append(callback)
+
+            if not self._ui_event_handler_registered:
+                def _event_handler(event_data: Dict):
+                    self._queue_ui_event_update(event_data)
+
+                state_manager.on_event_update(_event_handler)
+                self._ui_event_handler_registered = True
+        except Exception as e:
+            print(f"⚠️  Error registering event callback: {e}")
+
+    def _queue_ui_update(self, balance_data: Dict) -> None:
+        """Coalesce balance updates for UI callbacks."""
+        if not balance_data:
+            return
+
+        if self._ui_pending_payload:
+            self._ui_pending_payload.update(balance_data)
+        else:
+            self._ui_pending_payload = dict(balance_data)
+
+        if self._ui_timer and self._ui_timer.is_alive():
+            return
+
+        self._ui_timer = threading.Timer(self._ui_debounce, self._flush_ui_update)
+        self._ui_timer.daemon = True
+        self._ui_timer.start()
+
+    def _queue_ui_event_update(self, event_data: Dict) -> None:
+        """Coalesce transaction event updates for UI callbacks."""
+        if not event_data:
+            return
+
+        if self._ui_pending_events:
+            for addr, payload in event_data.items():
+                if addr in self._ui_pending_events:
+                    existing = self._ui_pending_events[addr]
+                    existing.setdefault('new_confirmed', []).extend(payload.get('new_confirmed', []))
+                    existing.setdefault('new_pending', []).extend(payload.get('new_pending', []))
+                    existing.setdefault('promoted', []).extend(payload.get('promoted', []))
+                    existing.setdefault('pending_cleared', []).extend(payload.get('pending_cleared', []))
+                else:
+                    self._ui_pending_events[addr] = payload
+        else:
+            self._ui_pending_events = dict(event_data)
+
+        if self._ui_timer and self._ui_timer.is_alive():
+            return
+
+        self._ui_timer = threading.Timer(self._ui_debounce, self._flush_ui_update)
+        self._ui_timer.daemon = True
+        self._ui_timer.start()
+
+    def _flush_ui_update(self) -> None:
+        payload = self._ui_pending_payload
+        events = self._ui_pending_events
+        self._ui_pending_payload = {}
+        self._ui_pending_events = {}
+
+        for callback in list(self._ui_callbacks):
+            try:
+                callback(payload)
+            except Exception as e:
+                print(f"⚠️  Error in UI callback: {e}")
+
+        for callback in list(self._ui_event_callbacks):
+            try:
+                callback(events)
+            except Exception as e:
+                print(f"⚠️  Error in UI event callback: {e}")
 
     def start_continuous_sync(
         self, blockchain=None, mempool=None, poll_interval: int = 30

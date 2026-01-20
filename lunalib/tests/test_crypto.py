@@ -11,7 +11,7 @@ class TestCrypto:
         address = key_manager.derive_address(public_key)
         
         assert len(private_key) == 64  # 32 bytes in hex
-        assert len(public_key) == 64   # 32 bytes in hex
+        assert len(public_key) == 130  # 04 + 64-byte x + 64-byte y
         assert address.startswith("LUN_")
 
     def test_data_signing(self):
@@ -25,7 +25,7 @@ class TestCrypto:
         signature = key_manager.sign_data(test_data, private_key)
         
         # Basic signature format check
-        assert len(signature) == 64
+        assert len(signature) == 128
         assert all(c in "0123456789abcdef" for c in signature.lower())
 
     def test_address_generation_uniqueness(self):

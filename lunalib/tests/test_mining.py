@@ -122,7 +122,7 @@ class TestMining:
         assert zero_reward == 0
         assert negative_reward == 0
 
-    @patch('lunalib.mining.miner.GenesisMiner._perform_mining')
+    @patch('lunalib.mining.miner.GenesisMiner._perform_bill_mining')
     def test_bill_mining_success(self, mock_mining, test_miner, test_wallet):
         """Test successful bill mining across different tiers"""
         wallet, wallet_data = test_wallet
@@ -147,12 +147,12 @@ class TestMining:
             result = test_miner.mine_bill(denomination, wallet_data['address'])
             
             assert result['success'] is True
-            assert result['denomination'] == denomination
-            assert result['luna_value'] == denomination  # 1:1 ratio
-            assert 'bill_serial' in result
+            assert result['bill']['denomination'] == denomination
+            assert result['bill']['luna_value'] == denomination  # 1:1 ratio
+            assert 'bill_serial' in result['bill']
             assert 'mining_time' in result
 
-    @patch('lunalib.mining.miner.GenesisMiner._perform_mining')
+    @patch('lunalib.mining.miner.GenesisMiner._perform_bill_mining')
     def test_high_difficulty_mining(self, mock_mining, test_miner, test_wallet):
         """Test mining for high difficulty tiers"""
         wallet, wallet_data = test_wallet
@@ -175,9 +175,9 @@ class TestMining:
             result = test_miner.mine_bill(denomination, wallet_data['address'])
             
             assert result['success'] is True
-            assert result['denomination'] == denomination
+            assert result['bill']['denomination'] == denomination
             # High denomination bills might have additional validation
-            assert result['luna_value'] >= denomination
+            assert result['bill']['luna_value'] >= denomination
 
     def test_mining_stop_functionality(self, test_miner):
         """Test mining stop functionality"""
@@ -208,7 +208,7 @@ class TestMining:
             assert result['success'] is False
             assert 'error' in result
 
-    @patch('lunalib.mining.miner.GenesisMiner._perform_mining')
+    @patch('lunalib.mining.miner.GenesisMiner._perform_bill_mining')
     def test_mining_failure(self, mock_mining, test_miner, test_wallet):
         """Test mining failure scenarios"""
         wallet, wallet_data = test_wallet
@@ -236,7 +236,7 @@ class TestMining:
 
     def test_mining_auto_stop(self, test_miner):
         """Test that mining can be stopped automatically"""
-        test_miner.start_auto_mining([100, 200, 300], "test_address")
+        test_miner.start_auto_bill_mining([100, 200, 300], "test_address")
         assert test_miner.mining_active is True
         
         # Stop mining and verify

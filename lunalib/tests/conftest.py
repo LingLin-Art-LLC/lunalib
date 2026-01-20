@@ -6,6 +6,12 @@ from lunalib.core.wallet import LunaWallet
 from lunalib.mining.miner import GenesisMiner
 from lunalib.gtx.genesis import GTXGenesis
 
+try:
+    import pytest_benchmark  # type: ignore
+    _HAS_BENCHMARK = True
+except Exception:
+    _HAS_BENCHMARK = False
+
 @pytest.fixture
 def temp_dir():
     """Create temporary directory for test data"""
@@ -39,3 +45,16 @@ def sample_transaction_data(test_wallet):
         "amount": 100.0,
         "memo": "Test transaction"
     }
+
+
+if not _HAS_BENCHMARK:
+    @pytest.fixture
+    def benchmark():
+        """Fallback benchmark fixture when pytest-benchmark isn't installed."""
+        def _runner(func, *args, **kwargs):
+            start = time.perf_counter()
+            result = func(*args, **kwargs)
+            elapsed = time.perf_counter() - start
+            print(f"[PERF] elapsed: {elapsed:.6f}s")
+            return result
+        return _runner

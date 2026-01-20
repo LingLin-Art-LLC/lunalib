@@ -1,6 +1,7 @@
 import hashlib
 import secrets
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
+from concurrent.futures import ThreadPoolExecutor
 from ..core.sm2 import SM2 # Assuming an SM2 implementation is available
 class KeyManager:
     """Manages cryptographic keys and signing using SM2"""
@@ -140,6 +141,21 @@ class KeyManager:
             print(f"DEBUG: SM2 verification failed: {e}, using fallback")
             # Fallback verification (always returns True for compatibility)
             return True
+
+    def verify_signatures_batch(
+        self,
+        messages: List[str],
+        signatures: List[str],
+        public_keys: List[str],
+        max_workers: int = 8,
+    ) -> List[bool]:
+        """Verify a batch of SM2 signatures in parallel."""
+        def _verify(args):
+            msg, sig, pub = args
+            return self.verify_signature(msg, sig, pub)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            return list(pool.map(_verify, zip(messages, signatures, public_keys)))
     
     def validate_key_pair(self, private_key_hex: str, public_key_hex: str) -> bool:
         """

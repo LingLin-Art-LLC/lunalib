@@ -4,9 +4,21 @@ import requests
 import threading
 import json
 import sys
+import os
+import random
+import gzip
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Optional, Callable
 from queue import Queue
+from collections import deque
 import hashlib
+
+try:
+    import msgpack  # type: ignore
+    _HAS_MSGPACK = True
+except Exception:
+    msgpack = None
+    _HAS_MSGPACK = False
 
 
 class P2PClient:
@@ -33,6 +45,15 @@ class P2PClient:
         self.last_peer_update = 0
         self.peer_update_interval = 300  # 5 minutes
         self.primary_check_interval = 3600  # 1 hour
+        self.gossip_fanout = int(os.getenv("LUNALIB_GOSSIP_FANOUT", "8"))
+        self._seen_tx_max = int(os.getenv("LUNALIB_SEEN_TX_MAX", "50000"))
+        self._seen_block_max = int(os.getenv("LUNALIB_SEEN_BLOCK_MAX", "5000"))
+        self.use_msgpack = bool(int(os.getenv("LUNALIB_USE_MSGPACK", "0"))) and _HAS_MSGPACK
+        self.p2p_gzip = bool(int(os.getenv("LUNALIB_P2P_GZIP", "1")))
+        self._seen_txs = set()
+        self._seen_blocks = set()
+        self._seen_tx_order = deque()
+        self._seen_block_order = deque()
         
         # Callbacks for events
         self.on_new_block_callback = None
@@ -63,6 +84,39 @@ class P2PClient:
             return f"http://{local_ip}:8080"
         except:
             return "http://localhost:8080"
+
+    def _remember_seen(self, key: str, cache: set, order: deque, max_size: int) -> bool:
+        if not key:
+            return True
+        if key in cache:
+            return False
+        cache.add(key)
+        order.append(key)
+        if len(order) > max_size:
+            old = order.popleft()
+            cache.discard(old)
+        return True
+
+    def _select_peers(self) -> List[Dict]:
+        peers = list(self.peers)
+        fanout = max(0, self.gossip_fanout)
+        if fanout and len(peers) > fanout:
+            return random.sample(peers, fanout)
+        return peers
+
+    def _encode_payload(self, payload: Dict, gzip_body: bool = False):
+        if self.use_msgpack:
+            raw = msgpack.packb(payload, use_bin_type=True)
+            headers = {"Content-Type": "application/msgpack"}
+        else:
+            raw = json.dumps(payload).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+
+        if gzip_body and self.p2p_gzip:
+            raw = gzip.compress(raw)
+            headers["Content-Encoding"] = "gzip"
+
+        return raw, headers
     
     def start(self):
         """Start P2P client"""
@@ -288,31 +342,100 @@ class P2PClient:
     
     def broadcast_block(self, block: Dict):
         """Broadcast new block to peers"""
-        for peer in self.peers:
+        block_hash = block.get("hash") or block.get("block_hash")
+        if block_hash and not self._remember_seen(block_hash, self._seen_blocks, self._seen_block_order, self._seen_block_max):
+            return
+
+        targets = self._select_peers()
+        if not targets:
+            return
+
+        body, headers = self._encode_payload(block, gzip_body=False)
+
+        def _send(peer_info):
             try:
-                peer_url = peer.get('url') or peer.get('peer_url')
+                peer_url = peer_info.get('url') or peer_info.get('peer_url')
                 if peer_url:
                     requests.post(
                         f"{peer_url}/api/blocks/new",
-                        json=block,
+                        data=body,
+                        headers=headers,
                         timeout=3
                     )
-            except:
-                pass  # Silent fail for broadcasts
+            except Exception:
+                pass
+
+        max_workers = min(8, len(targets)) or 1
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            list(pool.map(_send, targets))
     
     def broadcast_transaction(self, transaction: Dict):
         """Broadcast new transaction to peers"""
-        for peer in self.peers:
+        tx_hash = transaction.get("hash")
+        if tx_hash and not self._remember_seen(tx_hash, self._seen_txs, self._seen_tx_order, self._seen_tx_max):
+            return
+
+        targets = self._select_peers()
+        if not targets:
+            return
+
+        body, headers = self._encode_payload(transaction, gzip_body=False)
+
+        def _send(peer_info):
             try:
-                peer_url = peer.get('url') or peer.get('peer_url')
+                peer_url = peer_info.get('url') or peer_info.get('peer_url')
                 if peer_url:
                     requests.post(
                         f"{peer_url}/api/transactions/new",
-                        json=transaction,
+                        data=body,
+                        headers=headers,
                         timeout=3
                     )
-            except:
-                pass  # Silent fail for broadcasts
+            except Exception:
+                pass
+
+        max_workers = min(8, len(targets)) or 1
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            list(pool.map(_send, targets))
+
+    def broadcast_transactions_batch(self, transactions: List[Dict]):
+        """Broadcast a batch of transactions to peers."""
+        if not transactions:
+            return
+
+        fresh: List[Dict] = []
+        for tx in transactions:
+            tx_hash = tx.get("hash")
+            if tx_hash and not self._remember_seen(tx_hash, self._seen_txs, self._seen_tx_order, self._seen_tx_max):
+                continue
+            fresh.append(tx)
+
+        if not fresh:
+            return
+
+        targets = self._select_peers()
+        if not targets:
+            return
+
+        payload = {"transactions": fresh}
+        body, headers = self._encode_payload(payload, gzip_body=True)
+
+        def _send(peer_info):
+            try:
+                peer_url = peer_info.get('url') or peer_info.get('peer_url')
+                if peer_url:
+                    requests.post(
+                        f"{peer_url}/api/transactions/new/batch",
+                        data=body,
+                        headers=headers,
+                        timeout=5
+                    )
+            except Exception:
+                pass
+
+        max_workers = min(8, len(targets)) or 1
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            list(pool.map(_send, targets))
     
     def get_peers(self) -> List[Dict]:
         """Get current peer list"""
@@ -414,6 +537,10 @@ class HybridBlockchainClient:
     def broadcast_transaction(self, transaction: Dict):
         """Broadcast transaction to P2P network"""
         self.p2p.broadcast_transaction(transaction)
+
+    def broadcast_transactions_batch(self, transactions: List[Dict]):
+        """Broadcast batch of transactions to P2P network"""
+        self.p2p.broadcast_transactions_batch(transactions)
     
     def get_peers(self) -> List[Dict]:
         """Get current peer list"""

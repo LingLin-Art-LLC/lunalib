@@ -42,8 +42,8 @@ class TestLunaWallet:
         exported = wallet.export_private_key(wallet_data['address'], "test_password")
         assert exported is not None
         # FIXED: exported is the private key string, not a dict
-        assert exported.startswith('priv_')  # Check it's a valid private key format
-        assert len(exported) > 10
+        assert isinstance(exported, str)
+        assert len(exported) == 64  # SM2 private key hex length
 
     def test_wallet_balance_operations(self, test_wallet):
         """Test wallet balance operations"""

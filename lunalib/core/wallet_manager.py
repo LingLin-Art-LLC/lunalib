@@ -10,11 +10,14 @@ real-time updates available to the UI.
 
 import threading
 import time
+import os
+from collections import deque
 from typing import Dict, List, Optional, Callable, Set, Tuple
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 import json
 from datetime import datetime
+from lunalib.utils.console import print_info, print_success
 
 
 class TransactionType(Enum):
@@ -111,14 +114,67 @@ class WalletStateManager:
         self.state_lock = threading.RLock()
         self.balance_callbacks: List[Callable] = []
         self.transaction_callbacks: List[Callable] = []
-        from lunalib.utils.console import print_info, print_success
+        self.event_callbacks: List[Callable] = []
+        # Cache settings
+        self.max_confirmed_cache = int(os.getenv("LUNALIB_CONFIRMED_CACHE", "5000"))
+        self.max_pending_cache = int(os.getenv("LUNALIB_PENDING_CACHE", "2000"))
         # Cache for pending transactions to avoid duplicate processing
         self.processed_pending_hashes: Set[str] = set()
         self.processed_confirmed_hashes: Set[str] = set()
+        self._pending_hash_order = deque()
+        self._confirmed_hash_order = deque()
         # Sync control
         self.last_sync_time = 0
         self.sync_in_progress = False
         self.last_blockchain_height = 0
+        self._last_balance_snapshot: Dict[str, Dict] = {}
+        self._last_tx_hashes: Dict[str, Dict[str, Set[str]]] = {}
+        self._callback_debounce = float(os.getenv("LUNALIB_UI_DEBOUNCE", "0.25"))
+        self._pending_balance_changes: Dict[str, Dict] = {}
+        self._pending_tx_changes: Dict[str, Dict] = {}
+        self._pending_event_changes: Dict[str, Dict] = {}
+        self._callback_timer: Optional[threading.Timer] = None
+        self._seen_tx_cache = int(os.getenv("LUNALIB_SEEN_TX_CACHE", "20000"))
+        self._seen_tx_hashes: Set[str] = set()
+        self._seen_tx_order = deque()
+        self._confirmed_signature: Dict[str, str] = {}
+        self._mempool_signature: Dict[str, str] = {}
+
+    def _track_hash(self, tx_hash: str, cache: Set[str], order: deque, max_size: int) -> None:
+        if not tx_hash or tx_hash in cache:
+            return
+        cache.add(tx_hash)
+        order.append(tx_hash)
+        while len(order) > max_size:
+            old = order.popleft()
+            cache.discard(old)
+
+    def _track_seen_hash(self, tx_hash: str) -> None:
+        if not tx_hash or tx_hash in self._seen_tx_hashes:
+            return
+        self._seen_tx_hashes.add(tx_hash)
+        self._seen_tx_order.append(tx_hash)
+        while len(self._seen_tx_order) > self._seen_tx_cache:
+            old = self._seen_tx_order.popleft()
+            self._seen_tx_hashes.discard(old)
+
+    def _merge_transactions(self, existing: List[Transaction], new: List[Transaction], max_items: int) -> List[Transaction]:
+        if not new and not existing:
+            return []
+
+        merged: Dict[str, Transaction] = {tx.hash: tx for tx in existing if tx.hash}
+        for tx in new:
+            if tx.hash:
+                merged[tx.hash] = tx
+        sorted_list = sorted(merged.values(), key=lambda t: t.timestamp or 0, reverse=True)
+        if max_items > 0:
+            sorted_list = sorted_list[:max_items]
+        return sorted_list
+
+    def _trim_transactions(self, items: List[Transaction], max_items: int) -> List[Transaction]:
+        if max_items <= 0:
+            return items
+        return sorted(items, key=lambda t: t.timestamp or 0, reverse=True)[:max_items]
         
     # =========================================================================
     # Address normalization
@@ -215,21 +271,30 @@ class WalletStateManager:
         """
         processed = {}
         
+        norm_cache = {addr: self._normalize_address(addr) for addr in raw_transactions.keys()}
+
         for address, raw_txs in raw_transactions.items():
             transactions = []
+            address_norm = norm_cache.get(address, self._normalize_address(address))
             
             for raw_tx in raw_txs:
                 try:
+                    tx_hash = raw_tx.get('hash', '')
+                    if tx_hash and (tx_hash in self.processed_confirmed_hashes or tx_hash in self._seen_tx_hashes):
+                        continue
+
                     # Determine transaction direction
                     direction = ""
-                    if self._addresses_match(raw_tx.get('from'), address):
+                    from_norm = self._normalize_address(raw_tx.get('from'))
+                    to_norm = self._normalize_address(raw_tx.get('to'))
+                    if from_norm == address_norm:
                         direction = 'outgoing'
-                    if self._addresses_match(raw_tx.get('to'), address):
+                    if to_norm == address_norm:
                         direction = 'incoming'
                     
                     # Create Transaction object
                     tx = Transaction(
-                        hash=raw_tx.get('hash', ''),
+                        hash=tx_hash,
                         type=raw_tx.get('type', 'transfer'),
                         from_address=raw_tx.get('from', ''),
                         to_address=raw_tx.get('to', ''),
@@ -246,7 +311,8 @@ class WalletStateManager:
                     # Skip if we've already processed this
                     if tx.hash not in self.processed_confirmed_hashes:
                         transactions.append(tx)
-                        self.processed_confirmed_hashes.add(tx.hash)
+                        self._track_hash(tx.hash, self.processed_confirmed_hashes, self._confirmed_hash_order, self.max_confirmed_cache)
+                        self._track_seen_hash(tx.hash)
                         
                 except Exception as e:
                     print(f"⚠️  Error processing transaction {raw_tx.get('hash')}: {e}")
@@ -265,21 +331,31 @@ class WalletStateManager:
         """
         processed = {}
         
+        norm_cache = {addr: self._normalize_address(addr) for addr in raw_transactions.keys()}
+
         for address, raw_txs in raw_transactions.items():
             transactions = []
+            address_norm = norm_cache.get(address, self._normalize_address(address))
             
+            seen_hashes: Set[str] = set()
             for raw_tx in raw_txs:
                 try:
+                    tx_hash = raw_tx.get('hash', '')
+                    if tx_hash and (tx_hash in self.processed_pending_hashes or tx_hash in self._seen_tx_hashes):
+                        continue
+
                     # Determine transaction direction
                     direction = ""
-                    if self._addresses_match(raw_tx.get('from'), address):
+                    from_norm = self._normalize_address(raw_tx.get('from'))
+                    to_norm = self._normalize_address(raw_tx.get('to'))
+                    if from_norm == address_norm:
                         direction = 'outgoing'
-                    if self._addresses_match(raw_tx.get('to'), address):
+                    if to_norm == address_norm:
                         direction = 'incoming'
                     
                     # Create Transaction object
                     tx = Transaction(
-                        hash=raw_tx.get('hash', ''),
+                        hash=tx_hash,
                         type=raw_tx.get('type', 'transfer'),
                         from_address=raw_tx.get('from', ''),
                         to_address=raw_tx.get('to', ''),
@@ -291,10 +367,12 @@ class WalletStateManager:
                         direction=direction
                     )
                     
-                    # Skip if we've already processed this
-                    if tx.hash not in self.processed_pending_hashes:
-                        transactions.append(tx)
-                        self.processed_pending_hashes.add(tx.hash)
+                    if tx.hash and tx.hash in seen_hashes:
+                        continue
+                    transactions.append(tx)
+                    seen_hashes.add(tx.hash)
+                    self._track_hash(tx.hash, self.processed_pending_hashes, self._pending_hash_order, self.max_pending_cache)
+                    self._track_seen_hash(tx.hash)
                         
                 except Exception as e:
                     print(f"⚠️  Error processing pending transaction {raw_tx.get('hash')}: {e}")
@@ -376,15 +454,44 @@ class WalletStateManager:
             print_info(f"\n🔄 Syncing wallets...")
             sync_start = time.time()
             
-            # Process blockchain transactions
-            confirmed_map = self._process_blockchain_transactions(blockchain_transactions)
-            
-            # Process mempool transactions
-            pending_map = self._process_mempool_transactions(mempool_transactions)
+            # Process blockchain transactions (diff-based)
+            confirmed_changed: Dict[str, List[Dict]] = {}
+            for addr in self.wallet_states.keys():
+                txs = blockchain_transactions.get(addr, [])
+                hashes = sorted([tx.get("hash", "") for tx in txs if tx.get("hash")])
+                signature = "|".join(hashes)
+                if self._confirmed_signature.get(addr) != signature:
+                    confirmed_changed[addr] = txs
+                    self._confirmed_signature[addr] = signature
+
+            confirmed_map = self._process_blockchain_transactions(confirmed_changed)
+            for addr in self.wallet_states.keys():
+                if addr not in confirmed_changed:
+                    confirmed_map[addr] = self.wallet_states[addr].confirmed_transactions
+
+            # Process mempool transactions (diff-based)
+            mempool_changed: Dict[str, List[Dict]] = {}
+            for addr in self.wallet_states.keys():
+                txs = mempool_transactions.get(addr, [])
+                hashes = sorted([tx.get("hash", "") for tx in txs if tx.get("hash")])
+                signature = "|".join(hashes)
+                if self._mempool_signature.get(addr) != signature:
+                    mempool_changed[addr] = txs
+                    self._mempool_signature[addr] = signature
+
+            pending_map = self._process_mempool_transactions(mempool_changed)
+            for addr in self.wallet_states.keys():
+                if addr not in mempool_changed:
+                    pending_map[addr] = self.wallet_states[addr].pending_transactions
             
             # Get all addresses we're tracking
             all_addresses = set(self.wallet_states.keys())
             
+            # Track changes for event-driven UI updates
+            balance_changes: Dict[str, Dict] = {}
+            tx_changes: Dict[str, Dict] = {}
+            event_changes: Dict[str, Dict] = {}
+
             # Update each wallet
             for address in all_addresses:
                 state = self.wallet_states[address]
@@ -392,10 +499,22 @@ class WalletStateManager:
                 # Get transactions for this wallet
                 confirmed_txs = confirmed_map.get(address, [])
                 pending_txs = pending_map.get(address, [])
-                
-                # Clear old transactions (we'll repopulate from fresh data)
-                state.confirmed_transactions = confirmed_txs.copy()
-                state.pending_transactions = pending_txs.copy()
+
+                # Merge confirmed history (mini cache)
+                state.confirmed_transactions = self._merge_transactions(
+                    state.confirmed_transactions, confirmed_txs, self.max_confirmed_cache
+                )
+
+                # Pending should reflect current mempool; keep a small cache
+                state.pending_transactions = self._trim_transactions(
+                    pending_txs, self.max_pending_cache
+                )
+
+                # Remove any pending that are now confirmed
+                confirmed_hashes = {tx.hash for tx in state.confirmed_transactions if tx.hash}
+                state.pending_transactions = [
+                    tx for tx in state.pending_transactions if tx.hash not in confirmed_hashes
+                ]
                 
                 # Clear specialized lists and repopulate
                 state.confirmed_transfers = []
@@ -404,7 +523,7 @@ class WalletStateManager:
                 state.genesis_transactions = []
                 
                 # Categorize confirmed transactions
-                for tx in confirmed_txs:
+                for tx in state.confirmed_transactions:
                     categories = self._categorize_confirmed_transaction(tx, address)
                     for category in categories:
                         if category == 'confirmed_transfers':
@@ -415,7 +534,7 @@ class WalletStateManager:
                             state.genesis_transactions.append(tx)
                 
                 # Categorize pending transactions
-                for tx in pending_txs:
+                for tx in state.pending_transactions:
                     categories = self._categorize_pending_transaction(tx, address)
                     for category in categories:
                         if category == 'pending_transfers':
@@ -429,18 +548,61 @@ class WalletStateManager:
                 
                 # Calculate new balance
                 state.balance = self._calculate_balance_from_transactions(
-                    address, confirmed_txs, pending_txs
+                    address, state.confirmed_transactions, state.pending_transactions
                 )
                 
                 # Update timestamp
                 state.last_updated = time.time()
+
+                # Detect balance changes
+                current_balance = state.balance.to_dict()
+                last_balance = self._last_balance_snapshot.get(address)
+                if last_balance != current_balance:
+                    balance_changes[address] = current_balance
+
+                # Detect transaction changes
+                current_confirmed = {tx.hash for tx in state.confirmed_transactions if tx.hash}
+                current_pending = {tx.hash for tx in state.pending_transactions if tx.hash}
+                last_sets = self._last_tx_hashes.get(address, {"confirmed": set(), "pending": set()})
+                last_confirmed = last_sets.get("confirmed", set())
+                last_pending = last_sets.get("pending", set())
+
+                new_confirmed_hashes = current_confirmed - last_confirmed
+                new_pending_hashes = current_pending - last_pending
+                promoted_hashes = current_confirmed & last_pending
+                cleared_pending_hashes = last_pending - current_pending - promoted_hashes
+
+                if new_confirmed_hashes or new_pending_hashes or promoted_hashes or cleared_pending_hashes:
+                    tx_changes[address] = {
+                        'confirmed': [tx.to_dict() for tx in state.confirmed_transactions],
+                        'pending': [tx.to_dict() for tx in state.pending_transactions],
+                        'transfers': {
+                            'confirmed': [tx.to_dict() for tx in state.confirmed_transfers],
+                            'pending': [tx.to_dict() for tx in state.pending_transfers],
+                        },
+                        'rewards': [tx.to_dict() for tx in state.rewards],
+                    }
+
+                    event_changes[address] = {
+                        'new_confirmed': [tx.to_dict() for tx in state.confirmed_transactions if tx.hash in new_confirmed_hashes],
+                        'new_pending': [tx.to_dict() for tx in state.pending_transactions if tx.hash in new_pending_hashes],
+                        'promoted': [tx.to_dict() for tx in state.confirmed_transactions if tx.hash in promoted_hashes],
+                        'pending_cleared': list(cleared_pending_hashes),
+                    }
+
+                # Update last snapshots
+                self._last_balance_snapshot[address] = current_balance
+                self._last_tx_hashes[address] = {
+                    "confirmed": current_confirmed,
+                    "pending": current_pending,
+                }
             
             sync_time = time.time() - sync_start
             print_success(f"✅ Sync complete in {sync_time:.2f}s")
             
-            # Trigger callbacks
-            self._trigger_balance_updates()
-            self._trigger_transaction_updates()
+            # Trigger callbacks only when changes occur (debounced)
+            if balance_changes or tx_changes or event_changes:
+                self._queue_callback_updates(balance_changes, tx_changes, event_changes)
     
     def sync_wallets_background(self, get_blockchain_data: Callable,
                                get_mempool_data: Callable,
@@ -483,13 +645,16 @@ class WalletStateManager:
     def on_transaction_update(self, callback: Callable):
         """Register callback for transaction updates"""
         self.transaction_callbacks.append(callback)
+
+    def on_event_update(self, callback: Callable):
+        """Register callback for change-only event updates"""
+        self.event_callbacks.append(callback)
     
-    def _trigger_balance_updates(self):
+    def _trigger_balance_updates(self, balance_data: Optional[Dict] = None):
         """Trigger all balance update callbacks"""
-        with self.state_lock:
-            balance_data = {}
-            for addr, state in self.wallet_states.items():
-                balance_data[addr] = state.balance.to_dict()
+        if balance_data is None:
+            with self.state_lock:
+                balance_data = {addr: state.balance.to_dict() for addr, state in self.wallet_states.items()}
         
         for callback in self.balance_callbacks:
             try:
@@ -497,19 +662,21 @@ class WalletStateManager:
             except Exception as e:
                 print(f"⚠️  Balance callback error: {e}")
     
-    def _trigger_transaction_updates(self):
+    def _trigger_transaction_updates(self, transaction_data: Optional[Dict] = None):
         """Trigger all transaction update callbacks"""
-        with self.state_lock:
-            transaction_data = {}
-            for addr, state in self.wallet_states.items():
-                transaction_data[addr] = {
-                    'confirmed': [tx.to_dict() for tx in state.confirmed_transactions],
-                    'pending': [tx.to_dict() for tx in state.pending_transactions],
-                    'transfers': {
-                        'confirmed': [tx.to_dict() for tx in state.confirmed_transfers],
-                        'pending': [tx.to_dict() for tx in state.pending_transfers],
-                    },
-                    'rewards': [tx.to_dict() for tx in state.rewards],
+        if transaction_data is None:
+            with self.state_lock:
+                transaction_data = {
+                    addr: {
+                        'confirmed': [tx.to_dict() for tx in state.confirmed_transactions],
+                        'pending': [tx.to_dict() for tx in state.pending_transactions],
+                        'transfers': {
+                            'confirmed': [tx.to_dict() for tx in state.confirmed_transfers],
+                            'pending': [tx.to_dict() for tx in state.pending_transfers],
+                        },
+                        'rewards': [tx.to_dict() for tx in state.rewards],
+                    }
+                    for addr, state in self.wallet_states.items()
                 }
         
         for callback in self.transaction_callbacks:
@@ -517,6 +684,53 @@ class WalletStateManager:
                 callback(transaction_data)
             except Exception as e:
                 print(f"⚠️  Transaction callback error: {e}")
+
+    def _trigger_event_updates(self, event_data: Dict):
+        """Trigger all change-only event callbacks"""
+        for callback in self.event_callbacks:
+            try:
+                callback(event_data)
+            except Exception as e:
+                print(f"⚠️  Event callback error: {e}")
+
+    def _queue_callback_updates(
+        self,
+        balance_changes: Dict[str, Dict],
+        tx_changes: Dict[str, Dict],
+        event_changes: Dict[str, Dict],
+    ):
+        """Coalesce UI callbacks to reduce sync chatter."""
+        with self.state_lock:
+            if balance_changes:
+                self._pending_balance_changes.update(balance_changes)
+            if tx_changes:
+                self._pending_tx_changes.update(tx_changes)
+            if event_changes:
+                self._pending_event_changes.update(event_changes)
+
+            if self._callback_timer and self._callback_timer.is_alive():
+                return
+
+            self._callback_timer = threading.Timer(self._callback_debounce, self._flush_callback_updates)
+            self._callback_timer.daemon = True
+            self._callback_timer.start()
+
+    def _flush_callback_updates(self):
+        """Flush debounced callback payloads."""
+        with self.state_lock:
+            balance_payload = self._pending_balance_changes
+            tx_payload = self._pending_tx_changes
+            event_payload = self._pending_event_changes
+            self._pending_balance_changes = {}
+            self._pending_tx_changes = {}
+            self._pending_event_changes = {}
+
+        if balance_payload:
+            self._trigger_balance_updates(balance_payload)
+        if tx_payload:
+            self._trigger_transaction_updates(tx_payload)
+        if event_payload:
+            self._trigger_event_updates(event_payload)
     
     # =========================================================================
     # Query methods for UI

@@ -93,7 +93,7 @@ def test_blockchain_scan_chain_falls_back_to_peers(monkeypatch):
             return _response(200, {"blocks": [{"index": 0}]})
         return _response(404, {})
 
-    monkeypatch.setattr("requests.get", fake_get)
+    manager._session.get = fake_get
 
     data = manager.scan_chain(peer_urls=[peer_url])
     assert data

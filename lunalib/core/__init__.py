@@ -3,6 +3,7 @@ from .wallet import LunaWallet
 from .mempool import MempoolManager
 from .p2p import P2PClient, HybridBlockchainClient
 from .daemon import BlockchainDaemon
+from .daemon_server import DaemonHTTPServer
 
 __all__ = [
     'BlockchainManager',
@@ -10,5 +11,6 @@ __all__ = [
     'MempoolManager',
     'P2PClient',
     'HybridBlockchainClient',
-    'BlockchainDaemon'
+    'BlockchainDaemon',
+    'DaemonHTTPServer'
 ]

@@ -3,18 +3,20 @@ from unittest.mock import Mock, patch
 from lunalib.core.blockchain import BlockchainManager
 
 class TestBlockchain:
-    @patch('lunalib.core.blockchain.requests.get')
+    @patch('lunalib.core.blockchain.requests.Session.get')
     def test_blockchain_height(self, mock_get):
         """Test blockchain height retrieval"""
         mock_get.return_value.status_code = 200
-        mock_get.return_value.json.return_value = {'height': 1500}
+        mock_get.return_value.json.return_value = {
+            'blocks': [{'index': i, 'hash': '0'*64} for i in range(1501)]
+        }
         
         blockchain = BlockchainManager()
         height = blockchain.get_blockchain_height()
         
         assert height == 1500
 
-    @patch('lunalib.core.blockchain.requests.get')
+    @patch('lunalib.core.blockchain.requests.Session.get')
     def test_network_connection(self, mock_get):
         """Test network connection checking"""
         mock_get.return_value.status_code = 200

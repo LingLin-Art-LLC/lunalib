@@ -1,10 +1,21 @@
 # lunalib/core/daemon.py
 import time
 import threading
+import os
+import gzip
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Callable
 import json
 from datetime import datetime
+
+import requests
+
+try:
+    import msgpack  # type: ignore
+    _HAS_MSGPACK = True
+except Exception:
+    msgpack = None
+    _HAS_MSGPACK = False
 
 
 class BlockchainDaemon:
@@ -25,6 +36,9 @@ class BlockchainDaemon:
         # Thread pool for async operations
         self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="DaemonWorker")
         self._async_tasks = {}  # Track async tasks
+        self._peer_session = requests.Session()
+        self.use_msgpack = bool(int(os.getenv("LUNALIB_USE_MSGPACK", "0"))) and _HAS_MSGPACK
+        self.p2p_gzip = bool(int(os.getenv("LUNALIB_P2P_GZIP", "1")))
         
         # Peer registry
         self.peers = {}  # {node_id: peer_info}
@@ -40,7 +54,9 @@ class BlockchainDaemon:
             'blocks_validated': 0,
             'transactions_validated': 0,
             'peers_registered': 0,
-            'start_time': time.time()
+            'start_time': time.time(),
+            'tx_validation_seconds': 0.0,
+            'tx_validation_count': 0
         }
     
     def start(self):
@@ -211,7 +227,9 @@ class BlockchainDaemon:
             # Empty blocks use LINEAR system (difficulty = reward)
             # Regular blocks use EXPONENTIAL system (10^(difficulty-1))
             transactions = block.get('transactions', [])
-            is_empty_block = len(transactions) == 1 and transactions[0].get('is_empty_block', False)
+            reward_tx = next((tx for tx in transactions if tx.get('type') == 'reward'), None)
+            non_reward_txs = [tx for tx in transactions if tx.get('type') != 'reward']
+            is_empty_block = not non_reward_txs or (len(transactions) == 1 and reward_tx and reward_tx.get('is_empty_block', False))
             
             if is_empty_block:
                 # Empty block: linear reward (difficulty 1 = 1 LKC, difficulty 2 = 2 LKC, etc.)
@@ -222,17 +240,22 @@ class BlockchainDaemon:
                 expected_reward = self.difficulty_system.calculate_block_reward(difficulty)
                 reward_type = "Exponential"
             
-            actual_reward = block.get('reward', 0)
+            reward_tx_amount = reward_tx.get('amount', 0) if reward_tx else None
+            actual_reward = block.get('reward', reward_tx_amount if reward_tx_amount is not None else 0)
+            if reward_tx_amount is not None and block.get('reward') is not None and abs(float(block.get('reward', 0)) - float(reward_tx_amount)) > 0.01:
+                errors.append("Reward transaction amount does not match block reward")
             
             # Allow small tolerance for floating point comparison
             if abs(actual_reward - expected_reward) > 0.01:
                 errors.append(f"Reward mismatch ({reward_type}): expected {expected_reward} LKC for difficulty {difficulty}, got {actual_reward} LKC")
             
             # Validate transactions
-            for tx in block.get('transactions', []):
-                tx_validation = self.validate_transaction(tx)
-                if not tx_validation['valid']:
-                    errors.append(f"Invalid transaction: {tx_validation['message']}")
+            txs = block.get('transactions', [])
+            if txs:
+                batch = self.validate_transactions_batch(txs)
+                for res in batch.get("results", []):
+                    if not res.get("valid"):
+                        errors.append(f"Invalid transaction: {res.get('message')}")
             
             if errors:
                 return {'valid': False, 'message': 'Block validation failed', 'errors': errors}
@@ -252,6 +275,20 @@ class BlockchainDaemon:
         errors = []
         
         try:
+            start = time.perf_counter()
+            # Early reject (cheap checks)
+            tx_type = (transaction.get('type') or '').lower()
+            if tx_type in ("transfer", "transaction"):
+                for field in ('from', 'to', 'amount', 'timestamp', 'signature', 'public_key'):
+                    if field not in transaction:
+                        return {'valid': False, 'message': f'Missing field: {field}', 'errors': [f'Missing field: {field}']}
+                if not str(transaction.get('from', '')).startswith('LUN_') or not str(transaction.get('to', '')).startswith('LUN_'):
+                    return {'valid': False, 'message': 'Invalid address format', 'errors': ['Invalid address format']}
+                try:
+                    if float(transaction.get('amount', 0)) <= 0:
+                        return {'valid': False, 'message': 'Invalid amount', 'errors': ['Invalid amount']}
+                except Exception:
+                    return {'valid': False, 'message': 'Invalid amount', 'errors': ['Invalid amount']}
             # Basic validation
             tx_type = transaction.get('type')
             if not tx_type:
@@ -282,9 +319,9 @@ class BlockchainDaemon:
             # Security validation if available
             if self.security and not errors:
                 try:
-                    # Use security manager for advanced validation
-                    # security_result = self.security.validate_transaction(transaction)
-                    pass
+                    ok, msg = self.security.validate_transaction_security(transaction)
+                    if not ok:
+                        errors.append(msg)
                 except Exception as e:
                     errors.append(f"Security validation error: {e}")
             
@@ -292,10 +329,36 @@ class BlockchainDaemon:
                 return {'valid': False, 'message': 'Transaction validation failed', 'errors': errors}
             
             self.stats['transactions_validated'] += 1
+            self.stats['tx_validation_count'] += 1
+            self.stats['tx_validation_seconds'] += (time.perf_counter() - start)
             return {'valid': True, 'message': 'Transaction is valid', 'errors': []}
             
         except Exception as e:
             return {'valid': False, 'message': f'Validation error: {str(e)}', 'errors': [str(e)]}
+
+    def validate_transactions_batch(self, transactions: List[Dict], max_workers: int = 8) -> Dict:
+        """Validate a batch of transactions in parallel.
+
+        Returns: {'accepted': int, 'total': int, 'results': List[Dict]}
+        """
+        if self.security and hasattr(self.security, "validate_transaction_security_batch"):
+            sec_results = self.security.validate_transaction_security_batch(transactions, max_workers=max_workers)
+            results = [
+                {"valid": ok, "message": msg, "errors": [] if ok else [msg]}
+                for ok, msg in sec_results
+            ]
+        else:
+            results = []
+
+            def _validate(tx):
+                return self.validate_transaction(tx)
+
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                for res in pool.map(_validate, transactions):
+                    results.append(res)
+
+        accepted = sum(1 for res in results if res.get("valid"))
+        return {"accepted": accepted, "total": len(transactions), "results": results}
     
     def process_incoming_block_async(self, block: Dict, from_peer: Optional[str] = None, callback: Callable = None) -> str:
         """Async version: Process incoming block in background thread
@@ -339,6 +402,17 @@ class BlockchainDaemon:
             
             if success:
                 print(f"✅ Block #{block['index']} accepted from peer {from_peer}")
+
+                # Clear mined transactions from mempool
+                try:
+                    txs = block.get("transactions", []) if isinstance(block, dict) else []
+                    if hasattr(self.mempool, "remove_transaction"):
+                        for tx in txs:
+                            tx_hash = tx.get("hash") if isinstance(tx, dict) else None
+                            if tx_hash:
+                                self.mempool.remove_transaction(tx_hash)
+                except Exception as e:
+                    print(f"⚠️  Failed to clear mempool for block #{block.get('index')}: {e}")
                 
                 # Broadcast to other peers
                 self._broadcast_block_to_peers(block, exclude=from_peer)
@@ -364,7 +438,8 @@ class BlockchainDaemon:
                 return validation
             
             # Add to mempool
-            # self.mempool.add_transaction(transaction)
+            if hasattr(self.mempool, "add_transaction"):
+                self.mempool.add_transaction(transaction)
             print(f"✅ Transaction accepted from peer {from_peer}")
             
             # Broadcast to other peers
@@ -374,6 +449,87 @@ class BlockchainDaemon:
             
         except Exception as e:
             return {'success': False, 'message': f'Processing error: {str(e)}'}
+
+    def process_incoming_transactions_batch(self, transactions: List[Dict], from_peer: Optional[str] = None) -> Dict:
+        """Process a batch of incoming transactions from P2P network."""
+        try:
+            validation = self.validate_transactions_batch(transactions)
+            accepted_txs = [
+                tx for tx, res in zip(transactions, validation["results"]) if res.get("valid")
+            ]
+
+            if accepted_txs:
+                if hasattr(self.mempool, "add_transactions_batch_validated"):
+                    self.mempool.add_transactions_batch_validated(accepted_txs)
+                elif hasattr(self.mempool, "add_transactions_batch"):
+                    self.mempool.add_transactions_batch(accepted_txs)
+                else:
+                    for tx in accepted_txs:
+                        if hasattr(self.mempool, "add_transaction"):
+                            self.mempool.add_transaction(tx)
+            if from_peer:
+                if accepted_txs:
+                    self._broadcast_transactions_to_peers_batch(accepted_txs, exclude=from_peer)
+
+            return {
+                "success": True,
+                "accepted": len(accepted_txs),
+                "total": len(transactions),
+            }
+        except Exception as e:
+            return {"success": False, "message": f"Processing error: {str(e)}"}
+
+    def _encode_payload(self, payload: Dict, gzip_body: bool = False):
+        if self.use_msgpack:
+            raw = msgpack.packb(payload, use_bin_type=True)
+            headers = {"Content-Type": "application/msgpack"}
+        else:
+            raw = json.dumps(payload).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+
+        if gzip_body and self.p2p_gzip:
+            raw = gzip.compress(raw)
+            headers["Content-Encoding"] = "gzip"
+
+        return raw, headers
+
+    def _broadcast_transactions_to_peers_batch(self, transactions: List[Dict], exclude: Optional[str] = None):
+        """Broadcast a batch of transactions to peers in one request per peer."""
+        if not transactions:
+            return
+
+        with self.peer_lock:
+            targets = [
+                peer_info
+                for node_id, peer_info in self.peers.items()
+                if not exclude or node_id != exclude
+            ]
+
+        if not targets:
+            return
+
+        payload = {"transactions": transactions}
+        body, headers = self._encode_payload(payload, gzip_body=True)
+
+        def _send(peer_info: Dict):
+            try:
+                peer_url = peer_info.get("url") or peer_info.get("peer_url")
+                if peer_url:
+                    self._peer_session.post(
+                        f"{peer_url}/api/transactions/new/batch",
+                        data=body,
+                        headers=headers,
+                        timeout=5,
+                    )
+            except Exception:
+                pass
+
+        if self.executor:
+            for peer_info in targets:
+                self.executor.submit(_send, peer_info)
+        else:
+            for peer_info in targets:
+                _send(peer_info)
     
     def _broadcast_block_to_peers(self, block: Dict, exclude: Optional[str] = None):
         """Broadcast block to all registered peers except excluded one"""
@@ -478,7 +634,9 @@ class BlockchainDaemon:
             'transactions_validated': self.stats['transactions_validated'],
             'peers_registered': self.stats['peers_registered'],
             'active_peers': peer_count,
-            'mempool_size': len(self.mempool.get_pending_transactions()) if self.mempool else 0
+            'mempool_size': len(self.mempool.get_pending_transactions()) if self.mempool else 0,
+            'tx_validation_seconds': self.stats.get('tx_validation_seconds', 0.0),
+            'tx_validation_count': self.stats.get('tx_validation_count', 0)
         }
     
     def get_blockchain_state(self) -> Dict:

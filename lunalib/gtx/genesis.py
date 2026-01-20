@@ -2,6 +2,14 @@ import time
 import hashlib
 import secrets
 import json
+import sys
+
+def safe_print(*args, **kwargs):
+    encoding = sys.stdout.encoding or 'utf-8'
+    try:
+        print(*args, **kwargs)
+    except UnicodeEncodeError:
+        print(*(str(a).encode(encoding, errors='replace').decode(encoding) for a in args), **kwargs)
 from typing import Dict, List, Optional
 from .digital_bill import DigitalBill
 from .bill_registry import BillRegistry

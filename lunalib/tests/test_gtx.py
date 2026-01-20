@@ -80,7 +80,9 @@ class TestGTXGenesis:
                 'signature': signature,
                 'metadata_hash': metadata_hash,
                 'issued_to': user_address,
+                'denomination': denomination,
                 'front_serial': bill_serial,
+                'timestamp': timestamp,
                 'type': 'GTX_Genesis',
                 'back_serial': ''
             }

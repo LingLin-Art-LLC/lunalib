@@ -4,11 +4,13 @@ from tqdm import tqdm
 from ..storage.cache import BlockchainCache
 import requests
 import time
+import os
 import json
 import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor, Future
-from typing import Dict, List, Optional, Tuple, Callable
+from typing import Dict, List, Optional, Tuple, Callable, Union
+import gzip
 
 
 class BlockchainManager:
@@ -22,6 +24,7 @@ class BlockchainManager:
         self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="BlockchainWorker")
         self._async_tasks = {}  # Track async tasks by ID
         self._task_callbacks = {}  # Callbacks for task completion
+        self._session = requests.Session()
 
     # ------------------------------------------------------------------
     # Address helpers
@@ -70,7 +73,7 @@ class BlockchainManager:
             if not self._validate_transaction_before_broadcast(transaction):
                 return False, "Transaction validation failed"
             
-            response = requests.post(
+            response = self._session.post(
                 f'{self.endpoint_url}/mempool/add',
                 json=transaction,
                 headers={'Content-Type': 'application/json'},
@@ -191,7 +194,7 @@ class BlockchainManager:
         """Get current blockchain height - FIXED VERSION"""
         try:
             # Get the actual latest block to determine height
-            response = requests.get(f'{self.endpoint_url}/blockchain/blocks', timeout=10)
+            response = self._session.get(f'{self.endpoint_url}/blockchain/blocks', timeout=10)
             if response.status_code == 200:
                 data = response.json()
                 blocks = data.get('blocks', [])
@@ -213,7 +216,7 @@ class BlockchainManager:
     def get_latest_block(self) -> Optional[Dict]:
         """Get the actual latest block from server"""
         try:
-            response = requests.get(f'{self.endpoint_url}/blockchain/blocks', timeout=10)
+            response = self._session.get(f'{self.endpoint_url}/blockchain/blocks', timeout=10)
             if response.status_code == 200:
                 data = response.json()
                 blocks = data.get('blocks', [])
@@ -228,7 +231,7 @@ class BlockchainManager:
         def _fetch(base_url: str) -> Optional[Dict]:
             for url in (f"{base_url}/blockchain", f"{base_url}/api/blockchain/full"):
                 try:
-                    response = requests.get(url, timeout=30)
+                    response = self._session.get(url, timeout=30)
                     if response.status_code == 200:
                         data = response.json()
                         print(f"✅ Downloaded blockchain: {len(data.get('blocks', []))} blocks")
@@ -251,23 +254,91 @@ class BlockchainManager:
         print("❌ Failed to download blockchain from primary and peers")
         return None
     
-    def get_block(self, height: int) -> Optional[Dict]:
-        """Get block by height"""
+    def _looks_like_hash(self, value: str) -> bool:
+        if not value or len(value) != 64:
+            return False
+        return all(ch in "0123456789abcdefABCDEF" for ch in value)
+
+    def _fetch_blocks_list(self) -> List[Dict]:
+        try:
+            response = self._session.get(f'{self.endpoint_url}/blockchain/blocks', timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                if isinstance(data, list):
+                    return data
+                return data.get('blocks', [])
+        except Exception as e:
+            print(f"Get blocks list error: {e}")
+        return []
+
+    def get_block_by_height(self, height: int) -> Optional[Dict]:
+        """Get block by height (index)"""
         # Check cache first
         cached_block = self.cache.get_block(height)
         if cached_block:
             return cached_block
-            
+
         try:
-            response = requests.get(f'{self.endpoint_url}/blockchain/block/{height}', timeout=10)
+            response = self._session.get(f'{self.endpoint_url}/blockchain/block/{height}', timeout=10)
             if response.status_code == 200:
                 block = response.json()
                 self.cache.save_block(height, block.get('hash', ''), block)
                 return block
+            if response.status_code == 404:
+                # Fallback: some servers expect hash at /blockchain/block/<value>
+                blocks = self._fetch_blocks_list()
+                if 0 <= height < len(blocks):
+                    block = blocks[height]
+                    self.cache.save_block(height, block.get('hash', ''), block)
+                    return block
+                for block in blocks:
+                    block_index = block.get('index') if isinstance(block, dict) else None
+                    if block_index == height:
+                        self.cache.save_block(height, block.get('hash', ''), block)
+                        return block
         except Exception as e:
             print(f"Get block error: {e}")
-            
+
         return None
+
+    def get_block_by_hash(self, block_hash: str) -> Optional[Dict]:
+        """Get block by hash"""
+        if not block_hash:
+            return None
+
+        try:
+            response = self._session.get(f'{self.endpoint_url}/blockchain/block/{block_hash}', timeout=10)
+            if response.status_code == 200:
+                block = response.json()
+                height = block.get('index', block.get('height'))
+                if isinstance(height, int):
+                    self.cache.save_block(height, block.get('hash', ''), block)
+                return block
+        except Exception as e:
+            print(f"Get block by hash error: {e}")
+
+        # Fallback: scan blocks list
+        blocks = self._fetch_blocks_list()
+        for block in blocks:
+            if isinstance(block, dict) and block.get('hash') == block_hash:
+                height = block.get('index', block.get('height'))
+                if isinstance(height, int):
+                    self.cache.save_block(height, block.get('hash', ''), block)
+                return block
+
+        return None
+
+    def get_block(self, block_id: Union[int, str]) -> Optional[Dict]:
+        """Get block by height (int) or hash (str)."""
+        if isinstance(block_id, str):
+            value = block_id.strip()
+            if self._looks_like_hash(value):
+                return self.get_block_by_hash(value)
+            if value.isdigit():
+                return self.get_block_by_height(int(value))
+            return self.get_block_by_hash(value)
+
+        return self.get_block_by_height(int(block_id))
     
     def get_blocks_range_async(self, start_height: int, end_height: int, callback: Callable = None) -> str:
         """Async version: Get range of blocks in background thread
@@ -303,7 +374,7 @@ class BlockchainManager:
             return cached_blocks
 
         try:
-            response = requests.get(
+            response = self._session.get(
                 f'{self.endpoint_url}/blockchain/range?start={start_height}&end={end_height}',
                 timeout=30
             )
@@ -329,7 +400,7 @@ class BlockchainManager:
     def get_mempool(self) -> List[Dict]:
         """Get current mempool transactions"""
         try:
-            response = requests.get(f'{self.endpoint_url}/mempool', timeout=10)
+            response = self._session.get(f'{self.endpoint_url}/mempool', timeout=10)
             if response.status_code == 200:
                 return response.json()
         except Exception as e:
@@ -340,7 +411,7 @@ class BlockchainManager:
     def check_network_connection(self) -> bool:
         """Check if network is accessible"""
         try:
-            response = requests.get(f'{self.endpoint_url}/system/health', timeout=5)
+            response = self._session.get(f'{self.endpoint_url}/system/health', timeout=5)
             self.network_connected = response.status_code == 200
             return self.network_connected
         except:
@@ -363,6 +434,11 @@ class BlockchainManager:
             for block in blocks:
                 block_transactions = self._find_address_transactions(block, address)
                 transactions.extend(block_transactions)
+
+        max_tx = int(os.getenv("LUNALIB_SCAN_TX_LIMIT", "5000"))
+        if max_tx > 0 and len(transactions) > max_tx:
+            transactions.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+            transactions = transactions[:max_tx]
 
         print(f"[SCAN] Found {len(transactions)} total transactions for {address}")
         return transactions
@@ -424,6 +500,14 @@ class BlockchainManager:
                 for original_addr, txs in collected.items():
                     if txs:
                         results[original_addr].extend(txs)
+
+        max_tx = int(os.getenv("LUNALIB_SCAN_TX_LIMIT", "5000"))
+        if max_tx > 0:
+            for addr in addresses:
+                txs = results.get(addr, [])
+                if len(txs) > max_tx:
+                    txs.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+                    results[addr] = txs[:max_tx]
 
         # Summary
         total_txs = sum(len(txs) for txs in results.values())
@@ -602,10 +686,12 @@ class BlockchainManager:
             print(f"   Transactions: {len(block_data.get('transactions', []))} | Difficulty: {block_data.get('difficulty')}")
             
             # Step 2: Submit to the correct endpoint
-            response = requests.post(
+            raw = json.dumps(block_data).encode("utf-8")
+            gz = gzip.compress(raw)
+            response = self._session.post(
                 f'{self.endpoint_url}/blockchain/submit-block',
-                json=block_data,
-                headers={'Content-Type': 'application/json'},
+                data=gz,
+                headers={'Content-Type': 'application/json', 'Content-Encoding': 'gzip'},
                 timeout=30
             )
             

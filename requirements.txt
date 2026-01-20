@@ -1,7 +1,9 @@
 requests
 numpy
 pytest
+pytest-benchmark
 pandas
 tqdm
 colorama
 base58
+msgpack

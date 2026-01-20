@@ -43,6 +43,9 @@ class GenesisMiner:
     def mine_bill(self, denomination: float, user_address: str, bill_data: Dict = None) -> Dict:
         """Mine a GTX Genesis bill using DigitalBill system"""
         try:
+            if denomination not in [1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000]:
+                return {"success": False, "error": "Invalid denomination"}
+
             difficulty = self.difficulty_system.get_bill_difficulty(denomination)
             
             # Create digital bill using GTX system
@@ -278,11 +281,15 @@ class GenesisMiner:
     def _create_mining_reward_transaction(self, miner_address: str, block_height: int, 
                                         transactions: List[Dict], block_data: Dict = None) -> Dict:
         """Create mining reward transaction with validation of the mining proof"""
-        
         # Calculate reward
-        base_reward = 1.0  # Base block reward
-        total_fees = sum(tx.get('fee', 0) for tx in transactions)
-        total_reward = base_reward + total_fees
+        difficulty = block_data.get('difficulty', 0) if block_data else 0
+        non_reward_txs = [tx for tx in transactions if tx.get('type') != 'reward']
+        is_empty_block = not non_reward_txs
+
+        if is_empty_block:
+            total_reward = float(difficulty)
+        else:
+            total_reward = self.difficulty_system.calculate_block_reward(difficulty)
         
         # If block_data is provided, validate the mining proof
         if block_data:
@@ -1068,7 +1075,9 @@ class Miner:
         # Empty blocks use LINEAR system (difficulty = reward)
         # Regular blocks use EXPONENTIAL system (10^(difficulty-1))
         transactions = block.get('transactions', [])
-        is_empty_block = len(transactions) == 1 and transactions[0].get('is_empty_block', False)
+        reward_tx = next((tx for tx in transactions if tx.get('type') == 'reward'), None)
+        non_reward_txs = [tx for tx in transactions if tx.get('type') != 'reward']
+        is_empty_block = not non_reward_txs or (len(transactions) == 1 and reward_tx and reward_tx.get('is_empty_block', False))
         
         if is_empty_block:
             # Empty block: linear reward
@@ -1077,7 +1086,8 @@ class Miner:
             # Regular block: exponential reward
             expected_reward = self.difficulty_system.calculate_block_reward(difficulty)
         
-        actual_reward = block.get('reward', 0)
+        reward_tx_amount = reward_tx.get('amount', 0) if reward_tx else None
+        actual_reward = block.get('reward', reward_tx_amount if reward_tx_amount is not None else 0)
         
         # Allow some tolerance for floating point comparison
         if abs(actual_reward - expected_reward) > 0.01:
