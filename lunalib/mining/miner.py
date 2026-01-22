@@ -710,12 +710,21 @@ class Miner:
         self.gpu_enabled = _resolve_flag(gpu_flags, True)
         cpu_flags = ("enable_cpu_mining", "cpu_mining", "use_cpu")
         self.cpu_enabled = _resolve_flag(cpu_flags, True)
+        sm3_kernel_flags = ("cuda_sm3_kernel", "use_sm3_kernel", "gpu_sm3_kernel")
+        self.cuda_sm3_kernel = _resolve_flag(sm3_kernel_flags, True)
 
         # Initialize lunalib components
         self.blockchain_manager = BlockchainManager(endpoint_url=config.node_url)
         self.mempool_manager = MempoolManager([config.node_url])
         self.difficulty_system = DifficultySystem()
+        self.multi_gpu_enabled = getattr(self, 'multi_gpu_enabled', False)
+        if hasattr(self, 'config') and hasattr(self.config, 'multi_gpu_enabled'):
+            self.multi_gpu_enabled = bool(getattr(self.config, 'multi_gpu_enabled', False))
+        elif os.getenv('LUNALIB_MULTI_GPU', '0') == '1':
+            self.multi_gpu_enabled = True
         self.cuda_manager = CUDAManager() if self.gpu_enabled else None
+        if self.cuda_manager:
+            self.cuda_manager.use_sm3_kernel = self.cuda_sm3_kernel
         
         # Import security components
         try:
@@ -1136,12 +1145,18 @@ class Miner:
 
             cuda_result = None
             try:
-                cuda_result = self.cuda_manager.cuda_mine_batch(
-                    block_data, difficulty, batch_size=batch_size, progress_callback=_progress
-                )
-                safe_print(f"[DEBUG] cuda_manager.cuda_mine_batch returned: {cuda_result}")
+                if self.multi_gpu_enabled:
+                    safe_print("[DEBUG] Multi-GPU mining enabled. Using cuda_mine_multi_gpu_batch.")
+                    cuda_result = self.cuda_manager.cuda_mine_multi_gpu_batch(
+                        block_data, difficulty, batch_size=batch_size, progress_callback=_progress
+                    )
+                else:
+                    cuda_result = self.cuda_manager.cuda_mine_batch(
+                        block_data, difficulty, batch_size=batch_size, progress_callback=_progress
+                    )
+                safe_print(f"[DEBUG] cuda_manager mining returned: {cuda_result}")
             except Exception as ce:
-                safe_print(f"[DEBUG] Exception in cuda_manager.cuda_mine_batch: {ce}")
+                safe_print(f"[DEBUG] Exception in cuda_manager mining: {ce}")
                 return None
             if cuda_result and cuda_result.get('success'):
                 mining_time = float(cuda_result.get("mining_time", 0))
@@ -1355,6 +1370,20 @@ class Miner:
 
         if self.block_mined_callback:
             self.block_mined_callback(block_data)
+
+        # --- Update bills.db, mined blocks, and mining stats ---
+        try:
+            # Update bills.db if available in data_manager
+            if hasattr(self.data_manager, "update_bills_db"):
+                self.data_manager.update_bills_db(block_data)
+            # Update mined blocks record
+            if hasattr(self.data_manager, "record_mined_block"):
+                self.data_manager.record_mined_block(block_data)
+            # Update mining stats
+            if hasattr(self.data_manager, "update_mining_stats"):
+                self.data_manager.update_mining_stats(self.get_mining_stats())
+        except Exception as e:
+            safe_print(f"[WARN] Failed to update mining records: {e}")
 
         return True, f"Block #{block_data['index']} mined - Reward: {final_reward}", block_data
     

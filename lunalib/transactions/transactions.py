@@ -25,7 +25,8 @@ from lunalib.utils.hash import sm3_hex
 try:
     from ..core.crypto import KeyManager as SM2KeyManager
     SM2_AVAILABLE = True
-    safe_print("DEBUG: Using SM2 KeyManager from crypto module")
+    if os.getenv("LUNALIB_DEBUG", "0") == "1":
+        safe_print("DEBUG: Using SM2 KeyManager from crypto module")
 except ImportError as e:
     SM2_AVAILABLE = False
     safe_print(f"WARNING: SM2 KeyManager not available: {e}")

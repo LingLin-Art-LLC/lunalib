@@ -50,10 +50,14 @@ import threading
 import concurrent.futures
 from typing import Optional, Callable, Dict, List, Tuple
 from ..core.crypto import KeyManager
+from ..core.sm4 import SM4Cipher
+from lunalib.config import apply_profile
 from .wallet_db import WalletDB
 from lunalib.utils.hash import derive_key_sm3, hmac_sm3
 
 _WALLET_SALT = b"luna_wallet_salt"
+
+apply_profile()
 
 
 def _derive_wallet_key(password: str) -> bytes:
@@ -84,6 +88,13 @@ def _normalize_token_bytes(token) -> bytes:
 def _encrypt_with_password(plaintext: bytes, password: str) -> bytes:
     key = _derive_wallet_key(password)
     nonce = os.urandom(16)
+    cipher_mode = os.getenv("LUNALIB_WALLET_CIPHER", "wl3").lower()
+    if cipher_mode == "sm4":
+        sm4_key = key[:16]
+        use_gpu = os.getenv("LUNALIB_SM4_USE_GPU", "0") == "1"
+        ciphertext = SM4Cipher(sm4_key).encrypt_ctr(plaintext, nonce, use_gpu=use_gpu)
+        mac = hmac_sm3(key, nonce + ciphertext)
+        return b"WL4" + nonce + ciphertext + mac
     stream = _keystream(key, nonce, len(plaintext))
     ciphertext = bytes(a ^ b for a, b in zip(plaintext, stream))
     mac = hmac_sm3(key, nonce + ciphertext)
@@ -94,6 +105,17 @@ def _decrypt_with_password(token, password: str) -> bytes:
     token_bytes = _normalize_token_bytes(token)
     if token_bytes.startswith(b"gAAAA"):
         raise ValueError("Legacy Fernet token not supported without cryptography")
+    if token_bytes.startswith(b"WL4"):
+        nonce = token_bytes[3:19]
+        mac = token_bytes[-32:]
+        ciphertext = token_bytes[19:-32]
+        key = _derive_wallet_key(password)
+        expected_mac = hmac_sm3(key, nonce + ciphertext)
+        if not hmac.compare_digest(mac, expected_mac):
+            raise ValueError("Invalid password or corrupted data")
+        sm4_key = key[:16]
+        use_gpu = os.getenv("LUNALIB_SM4_USE_GPU", "0") == "1"
+        return SM4Cipher(sm4_key).decrypt_ctr(ciphertext, nonce, use_gpu=use_gpu)
     if not token_bytes.startswith(b"WL3"):
         raise ValueError("Unsupported wallet encryption format")
     nonce = token_bytes[3:19]

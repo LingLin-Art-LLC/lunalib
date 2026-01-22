@@ -1,9 +1,25 @@
 import hashlib
 import secrets
+import os
+from lunalib.config import apply_profile
 from typing import Optional, Tuple, List
 from concurrent.futures import ThreadPoolExecutor
 from ..core.sm2 import SM2 # Assuming an SM2 implementation is available
+from ..core.sm2_cuda.sm2_gpu import sm2_sign_gpu
+try:
+    from ..core.sm2_cuda.sm2_gpu import CUDA_AVAILABLE as _CUDA_AVAILABLE
+except Exception:
+    _CUDA_AVAILABLE = False
+
+try:
+    from ..core.sm2_c import sm2_ext as sm2_c_ext  # type: ignore
+    _HAS_SM2_C = True
+except Exception:
+    sm2_c_ext = None
+    _HAS_SM2_C = False
 from lunalib.utils.hash import sm3_hex
+apply_profile()
+
 class KeyManager:
     """Manages cryptographic keys and signing using SM2"""
     
@@ -137,8 +153,17 @@ class KeyManager:
             if cached:
                 return cached
 
-            # Use SM2 signing
-            signature = self.sm2.sign(data.encode('utf-8'), private_key_hex)
+            backend = os.getenv("LUNALIB_SM2_BACKEND")
+            if not backend:
+                backend = "phos" if _CUDA_AVAILABLE and _HAS_SM2_C else "python"
+            backend = backend.lower()
+            if backend in {"phos", "cpython"} and _HAS_SM2_C:
+                priv_bytes = bytes.fromhex(private_key_hex)
+                sig_bytes = sm2_c_ext.sign(data.encode("utf-8"), priv_bytes)
+                signature = sig_bytes.hex()
+            else:
+                # Use SM2 signing
+                signature = self.sm2.sign(data.encode('utf-8'), private_key_hex)
             print(f"DEBUG: Signed data with SM2, signature: {signature[:16]}...")
             self._signing_key_cache[(private_key_hex, data)] = signature
             return signature
@@ -194,6 +219,22 @@ class KeyManager:
 
         def _sign(msg: str) -> str:
             return self.sign_data(msg, private_key_hex)
+
+        backend = os.getenv("LUNALIB_SM2_BACKEND")
+        if not backend:
+            backend = "phos" if _CUDA_AVAILABLE and _HAS_SM2_C else "python"
+        backend = backend.lower()
+        use_gpu = os.getenv("LUNALIB_SM2_GPU", "0") == "1"
+        if backend in {"phos", "cpython"} and _HAS_SM2_C and not use_gpu:
+            priv_bytes = bytes.fromhex(private_key_hex)
+            return [sm2_c_ext.sign(msg.encode("utf-8"), priv_bytes).hex() for msg in messages]
+        if use_gpu:
+            # GPU path supports same-message batches only
+            if len(set(messages)) == 1:
+                priv_bytes = bytes.fromhex(private_key_hex)
+                priv_list = [priv_bytes for _ in messages]
+                sigs = sm2_sign_gpu(messages[0].encode("utf-8"), priv_list, use_gpu=True)
+                return [s.hex() for s in sigs]
 
         if max_workers and max_workers > 1:
             with ThreadPoolExecutor(max_workers=max_workers) as pool:

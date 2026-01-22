@@ -783,13 +783,27 @@ class BlockchainManager:
 
             raw = json.dumps(block_data).encode("utf-8")
             gz = gzip.compress(raw)
-            response = _post(gz, {'Content-Type': 'application/json', 'Content-Encoding': 'gzip'})
+            # Try gzip first, with correct headers
+            response = _post(
+                gz,
+                {
+                    'Content-Type': 'application/json',
+                    'Content-Encoding': 'gzip',
+                    'Accept-Encoding': 'gzip, deflate',
+                }
+            )
 
             # Fallback to plain JSON if gzip fails or non-2xx
             if response is None or response.status_code not in [200, 201]:
                 if response is not None:
                     print(f"⚠️ Gzip submit failed: HTTP {response.status_code} - {response.text}")
-                response = _post(raw, {'Content-Type': 'application/json'})
+                response = _post(
+                    raw,
+                    {
+                        'Content-Type': 'application/json',
+                        'Accept-Encoding': 'gzip, deflate',
+                    }
+                )
 
             # Step 3: Handle response
             if response and response.status_code in [200, 201]:

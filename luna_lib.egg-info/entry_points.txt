@@ -1,2 +1,0 @@
-[console_scripts]
-luna-wallet = luna_lib.cli:main

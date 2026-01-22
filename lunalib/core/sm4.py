@@ -4,6 +4,8 @@ SM4 block cipher with optional NumPy/CuPy acceleration for batch operations.
 
 from __future__ import annotations
 
+import os
+from lunalib.config import apply_profile
 from typing import Iterable, Optional
 
 try:
@@ -15,6 +17,13 @@ try:
     import cupy as cp  # type: ignore
 except Exception:  # pragma: no cover - optional
     cp = None
+
+try:
+    from .sm4_cuda.sm4_gpu import sm4_crypt_blocks_gpu, sm4_crypt_blocks_gpu_raw, CUDA_AVAILABLE as _SM4_CUDA_AVAILABLE
+except Exception:
+    sm4_crypt_blocks_gpu = None
+    sm4_crypt_blocks_gpu_raw = None
+    _SM4_CUDA_AVAILABLE = False
 
 
 _SBOX = [
@@ -36,6 +45,8 @@ _SBOX = [
     0x18, 0xf0, 0x7d, 0xec, 0x3a, 0xdc, 0x4d, 0x20, 0x79, 0xee, 0x5f, 0x3e, 0xd7, 0xcb, 0x39, 0x48,
 ]
 
+apply_profile()
+
 _FK = [0xA3B1BAC6, 0x56AA3350, 0x677D9197, 0xB27022DC]
 
 _CK = [
@@ -48,6 +59,9 @@ _CK = [
     0xA0A7AEB5, 0xBCC3CAD1, 0xD8DFE6ED, 0xF4FB0209,
     0x10171E25, 0x2C333A41, 0x484F565D, 0x646B7279,
 ]
+
+_SBOX_NP = None
+_SBOX_CP = None
 
 
 def _rotl32(x, n, xp):
@@ -117,6 +131,21 @@ def _crypt_blocks(blocks: bytes, rk: list[int], decrypt: bool = False, use_gpu: 
     if len(blocks) % 16 != 0:
         raise ValueError("Data length must be multiple of 16 bytes")
 
+    blocks_count = len(blocks) // 16
+    min_blocks = int(os.getenv("LUNALIB_SM4_MIN_BLOCKS", "8"))
+    if blocks_count < min_blocks:
+        out = bytearray()
+        keys = rk[::-1] if decrypt else rk
+        for i in range(0, len(blocks), 16):
+            out.extend(_crypt_block(blocks[i:i+16], keys))
+        return bytes(out)
+
+    if use_gpu and os.getenv("LUNALIB_SM4_CUDA_KERNEL", "0") == "1" and _SM4_CUDA_AVAILABLE:
+        try:
+            return sm4_crypt_blocks_gpu(blocks, rk[::-1] if decrypt else rk)
+        except Exception:
+            pass
+
     if np is None:
         # Fallback to scalar path
         out = bytearray()
@@ -126,17 +155,18 @@ def _crypt_blocks(blocks: bytes, rk: list[int], decrypt: bool = False, use_gpu: 
         return bytes(out)
 
     xp = cp if (use_gpu and cp is not None) else np
-    sbox = xp.asarray(_SBOX, dtype=xp.uint8)
+    global _SBOX_NP, _SBOX_CP
+    if xp is np:
+        if _SBOX_NP is None:
+            _SBOX_NP = np.asarray(_SBOX, dtype=np.uint8)
+        sbox = _SBOX_NP
+    else:
+        if _SBOX_CP is None:
+            _SBOX_CP = cp.asarray(_SBOX, dtype=cp.uint8)
+        sbox = _SBOX_CP
 
-    data = np.frombuffer(blocks, dtype=np.uint8)
-    data = data.reshape(-1, 16)
-    words = data.reshape(-1, 4, 4)
-    x = words[:, :, 0].astype(np.uint32) << 24
-    x |= words[:, :, 1].astype(np.uint32) << 16
-    x |= words[:, :, 2].astype(np.uint32) << 8
-    x |= words[:, :, 3].astype(np.uint32)
-
-    x = xp.asarray(x, dtype=xp.uint32)
+    data = np.frombuffer(blocks, dtype=">u4").reshape(-1, 4)
+    x = xp.asarray(data, dtype=xp.uint32)
 
     x0, x1, x2, x3 = x[:, 0], x[:, 1], x[:, 2], x[:, 3]
     keys = rk[::-1] if decrypt else rk
@@ -145,18 +175,10 @@ def _crypt_blocks(blocks: bytes, rk: list[int], decrypt: bool = False, use_gpu: 
         x4 = x0 ^ t
         x0, x1, x2, x3 = x1, x2, x3, x4
 
-    out_words = xp.stack([x3, x2, x1, x0], axis=1)
-    out_words = out_words.astype(xp.uint32)
-
+    out_words = xp.stack([x3, x2, x1, x0], axis=1).astype(xp.uint32)
     if xp is cp:
         out_words = out_words.get()
-
-    out_bytes = bytearray()
-    for row in out_words:
-        for w in row:
-            out_bytes.extend(int(w).to_bytes(4, "big"))
-
-    return bytes(out_bytes)
+    return out_words.astype(">u4").tobytes()
 
 
 class _FakeNP:
@@ -192,14 +214,20 @@ class SM4Cipher:
         return _crypt_block(block, self.round_keys[::-1])
 
     def encrypt_ecb(self, data: bytes, use_gpu: bool = False) -> bytes:
+        if not use_gpu and cp is not None and os.getenv("LUNALIB_SM4_USE_GPU", "0") == "1":
+            use_gpu = True
         data = _pkcs7_pad(data)
         return _crypt_blocks(data, self.round_keys, decrypt=False, use_gpu=use_gpu)
 
     def decrypt_ecb(self, data: bytes, use_gpu: bool = False) -> bytes:
+        if not use_gpu and cp is not None and os.getenv("LUNALIB_SM4_USE_GPU", "0") == "1":
+            use_gpu = True
         plain = _crypt_blocks(data, self.round_keys, decrypt=True, use_gpu=use_gpu)
         return _pkcs7_unpad(plain)
 
     def encrypt_ctr(self, data: bytes, iv: bytes, use_gpu: bool = False) -> bytes:
+        if not use_gpu and cp is not None and os.getenv("LUNALIB_SM4_USE_GPU", "0") == "1":
+            use_gpu = True
         if len(iv) != 16:
             raise ValueError("IV must be 16 bytes")
         return _crypt_ctr(data, self.round_keys, iv, use_gpu=use_gpu)
@@ -253,18 +281,64 @@ def _crypt_ctr(data: bytes, rk: list[int], iv: bytes, use_gpu: bool = False) -> 
         raise ValueError("IV must be 16 bytes")
 
     blocks = (len(data) + 15) // 16
-    counters = []
+    min_blocks = int(os.getenv("LUNALIB_SM4_CTR_MIN_BLOCKS", "8"))
+    chunk_blocks = int(os.getenv("LUNALIB_SM4_CTR_CHUNK_BLOCKS", "131072"))
     counter = int.from_bytes(iv, "big")
-    for _ in range(blocks):
-        counters.append(counter.to_bytes(16, "big"))
-        counter = (counter + 1) & ((1 << 128) - 1)
 
-    keystream = _crypt_blocks(b"".join(counters), rk, decrypt=False, use_gpu=use_gpu)
+    out = bytearray(len(data))
+    offset = 0
+    remaining = blocks
+    use_gpu_xor = (
+        use_gpu
+        and cp is not None
+        and _SM4_CUDA_AVAILABLE
+        and os.getenv("LUNALIB_SM4_CTR_GPU_XOR", "0") == "1"
+    )
+    while remaining > 0:
+        take = remaining if remaining < chunk_blocks else chunk_blocks
+        if np is not None and take >= min_blocks:
+            hi = (counter >> 64) & 0xFFFFFFFFFFFFFFFF
+            lo = counter & 0xFFFFFFFFFFFFFFFF
+            idx = np.arange(take, dtype=np.uint64)
+            lo_arr = (np.uint64(lo) + idx).astype(np.uint64)
+            carry = (lo_arr < np.uint64(lo)).astype(np.uint64)
+            hi_arr = (np.uint64(hi) + carry) & np.uint64(0xFFFFFFFFFFFFFFFF)
+            counters = np.empty((take, 2), dtype=">u8")
+            counters[:, 0] = hi_arr
+            counters[:, 1] = lo_arr
+            counter_bytes = counters.tobytes()
+        else:
+            counters = []
+            cur = counter
+            for _ in range(take):
+                counters.append(cur.to_bytes(16, "big"))
+                cur = (cur + 1) & ((1 << 128) - 1)
+            counter_bytes = b"".join(counters)
 
-    out = bytearray()
-    for i in range(blocks):
-        chunk = data[i*16:(i+1)*16]
-        ks = keystream[i*16:(i+1)*16]
-        out.extend(bytes(a ^ b for a, b in zip(chunk, ks)))
+        if use_gpu_xor and sm4_crypt_blocks_gpu_raw is not None:
+            ks_gpu = sm4_crypt_blocks_gpu_raw(counter_bytes, rk)
+            chunk_len = min(len(data) - offset, take * 16)
+            data_gpu = cp.frombuffer(data[offset:offset + chunk_len], dtype=cp.uint8)
+            xor_gpu = cp.bitwise_xor(data_gpu, ks_gpu[:chunk_len])
+            out[offset:offset + chunk_len] = cp.asnumpy(xor_gpu).tobytes()
+        else:
+            keystream = _crypt_blocks(counter_bytes, rk, decrypt=False, use_gpu=use_gpu)
+            chunk_len = min(len(data) - offset, take * 16)
+            out[offset:offset + chunk_len] = _xor_bytes(data[offset:offset + chunk_len], keystream[:chunk_len])
+
+        counter = (counter + take) & ((1 << 128) - 1)
+        offset += chunk_len
+        remaining -= take
 
     return bytes(out)
+
+
+def _xor_bytes(a: bytes, b: bytes) -> bytes:
+    if len(a) != len(b):
+        raise ValueError("XOR inputs must have the same length")
+    min_bytes = int(os.getenv("LUNALIB_SM4_XOR_MIN_BYTES", "4096"))
+    if np is not None and len(a) >= min_bytes:
+        arr_a = np.frombuffer(a, dtype=np.uint8)
+        arr_b = np.frombuffer(b, dtype=np.uint8)
+        return np.bitwise_xor(arr_a, arr_b).tobytes()
+    return bytes(x ^ y for x, y in zip(a, b))
