@@ -10,7 +10,7 @@ def safe_print(*args, **kwargs):
         encoding = getattr(sys.stdout, 'encoding', 'utf-8')
         print(*(str(a).encode(encoding, errors='replace').decode(encoding) for a in args), **kwargs)
 import hashlib
-from lunalib.utils.hash import sm3_hex
+from lunalib.core.sm3 import sm3_hex
 import json
 import threading
 from typing import Dict, Optional, List, Union, Callable

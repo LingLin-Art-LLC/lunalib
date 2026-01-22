@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: lunalib
-Version: 2.3.6
+Version: 2.3.9
 Summary: Cryptocurrency Ecosystem library (LunaLib) by Sanny and Ling Lin
 Home-page: https://github.com/taellinglin/LunaLib
 Author-email: taellinglin@gmail.com
@@ -18,11 +18,14 @@ Requires-Dist: tqdm
 Requires-Dist: base58
 Requires-Dist: colorama
 Requires-Dist: msgpack
+Provides-Extra: gpu
+Requires-Dist: cupy-cuda12x; extra == "gpu"
 Dynamic: author-email
 Dynamic: classifier
 Dynamic: description
 Dynamic: description-content-type
 Dynamic: home-page
+Dynamic: provides-extra
 Dynamic: requires-dist
 Dynamic: requires-python
 Dynamic: summary

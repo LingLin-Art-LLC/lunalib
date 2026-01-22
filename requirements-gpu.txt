@@ -1,0 +1,2 @@
+# Optional GPU dependencies for LunaLib
+cupy-cuda12x
