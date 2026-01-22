@@ -11,7 +11,14 @@ from .core.blockchain import BlockchainManager
 from .core.mempool import MempoolManager
 from .core.wallet_manager import WalletStateManager, get_wallet_manager
 
-__version__ = "2.2.3"
+try:
+    from importlib.metadata import version, PackageNotFoundError
+    try:
+        __version__ = version("lunalib")
+    except PackageNotFoundError:
+        __version__ = "unknown"
+except ImportError:
+    __version__ = "unknown"
 __all__ = [
     'LunaWallet', 
     'GenesisMiner', 
