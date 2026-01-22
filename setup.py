@@ -1,4 +1,7 @@
 from setuptools import setup, find_packages, Extension
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
 
 sm2_ext = Extension(
     "lunalib.core.sm2_c.sm2_ext",
@@ -7,6 +10,7 @@ sm2_ext = Extension(
         "lunalib/core/sm2_c/sm2_bn.c",
         "lunalib/core/sm2_c/sm2_ec.c",
     ],
+    include_dirs=[str(BASE_DIR / "lunalib" / "core" / "sm2_c")],
 )
 
 setup(

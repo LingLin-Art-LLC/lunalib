@@ -1,4 +1,5 @@
 .gitignore
+MANIFEST.in
 README.md
 requirements.txt
 setup.py
@@ -42,10 +43,14 @@ lunalib/core/__pycache__/mempool.cpython-310.pyc
 lunalib/core/__pycache__/wallet.cpython-310.pyc
 lunalib/core/sm2_c/__init__.py
 lunalib/core/sm2_c/sm2_bn.c
+lunalib/core/sm2_c/sm2_bn.h
 lunalib/core/sm2_c/sm2_ec.c
+lunalib/core/sm2_c/sm2_ec.h
 lunalib/core/sm2_c/sm2_ext.c
 lunalib/core/sm2_cuda/__init__.py
 lunalib/core/sm2_cuda/sm2_gpu.py
+lunalib/core/sm4_cuda/sm4_gpu.py
+lunalib/core/sm4_cuda/sm4_kernel.cu
 lunalib/gtx/__init__.py
 lunalib/gtx/bill_registry.py
 lunalib/gtx/digital_bill.py

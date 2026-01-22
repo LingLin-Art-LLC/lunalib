@@ -1,16 +1,17 @@
 import os
 import time
 from lunalib.mining.miner import Miner
-from lunalib.core.sm3 import sm3_hex
 
 # Dummy config for demonstration
 class Config:
     node_url = "https://bank.linglin.art"
-    miner_address = "LUN_BtAZyfkkTyS12fcDE9R8RygeyHWz3VMZE8"
+    miner_address = "LUN_CCHhmzZBcbuSPrEHeBozWwJ6bCBwmhvUF6"
     difficulty = 3
     enable_gpu_mining = True
     enable_cpu_mining = True
     cuda_batch_size = 100000
+    multi_gpu_enabled = True
+    cuda_sm3_kernel = True
 
 # Dummy DataManager (replace with your actual implementation)
 class DummyDataManager:
@@ -36,6 +37,8 @@ def mining_status_callback(data):
     print(f"[STATUS] {phase} | {msg} | Engine: {engine} | Hashrate: {rate:,.0f} H/s")
 
 def main():
+    os.environ.setdefault("LUNALIB_CUDA_SM3", "1")
+    os.environ.setdefault("LUNALIB_MULTI_GPU", "1")
     config = Config()
     data_manager = DummyDataManager()
     miner = Miner(config, data_manager, block_mined_callback=block_mined_callback)

@@ -1,0 +1,7 @@
+recursive-include lunalib/core/sm2_c *.h
+recursive-include lunalib/core/sm2_c *.c
+recursive-include lunalib/core/sm4_cuda *.cu
+recursive-include lunalib/core/sm4_cuda *.py
+recursive-include lunalib/mining/sm3_cuda *.cu
+recursive-include lunalib/mining/sm3_cuda *.py
+recursive-include lunalib/mining/sm3_cuda *.h
