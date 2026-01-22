@@ -1,0 +1,40 @@
+{
+  "duration_seconds": 60.0,
+  "blocks_found": 4,
+  "hashrate_samples": 21,
+  "hashrate_min": 1801154733.9152093,
+  "hashrate_avg": 4230494087.9978733,
+  "hashrate_median": 3414555348.565539,
+  "hashrate_max": 7785749723.778393,
+  "hashrate_p95": 7775461976.512322,
+  "gpu_samples": {
+    "0": 106,
+    "1": 106
+  },
+  "blocks": [
+    {
+      "index": 501,
+      "hash": "000000000585030095d3cf657e33872e89ac79c480991241f313d31d6942d1b8",
+      "nonce": 23794498523,
+      "difficulty": 9
+    },
+    {
+      "index": 501,
+      "hash": "000000000785553f971469659eb7283865ef7235a8bc609ab905044255ab19ac",
+      "nonce": 75841485119,
+      "difficulty": 9
+    },
+    {
+      "index": 501,
+      "hash": "000000000eeacd85a6b32c8e78ce9a96062a7096296ad3cd946dd55500fbe67b",
+      "nonce": 197473907072,
+      "difficulty": 9
+    },
+    {
+      "index": 501,
+      "hash": "0000000005b71297ae472c25c64bf7ee83bb0c99df43ce367f8164e3e078da37",
+      "nonce": 156782395844,
+      "difficulty": 9
+    }
+  ]
+}

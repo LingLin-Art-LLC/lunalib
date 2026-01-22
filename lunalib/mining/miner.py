@@ -10,7 +10,8 @@ def safe_print(*args, **kwargs):
         encoding = getattr(sys.stdout, 'encoding', 'utf-8')
         print(*(str(a).encode(encoding, errors='replace').decode(encoding) for a in args), **kwargs)
 import hashlib
-from lunalib.core.sm3 import sm3_hex
+import struct
+from lunalib.core.sm3 import sm3_hex, sm3_digest
 import json
 import threading
 from typing import Dict, Optional, List, Union, Callable
@@ -393,6 +394,17 @@ class GenesisMiner:
                 if json_hash_empty == block_hash:
                     validation_passed = True
                     print("✅ JSON empty format validation passed")
+
+            # Method 4: Compact mining format
+            if not validation_passed:
+                compact_hash = self._calculate_block_hash_compact(
+                    block_height, previous_hash, timestamp, nonce, miner, difficulty
+                )
+                print("🔍 Compact format validation:")
+                print(f"  Calculated: {compact_hash[:16]}...")
+                if compact_hash == block_hash:
+                    validation_passed = True
+                    print("✅ Compact format validation passed")
             
             if not validation_passed:
                 print("❌ All validation methods failed")
@@ -691,7 +703,7 @@ class Miner:
         self.block_added_callback = block_added_callback  # 新規: ブロックがチェーンに追加された時のコールバック
         self.mining_status_callbacks: List[Callable] = []
 
-        self.mining_history = self.data_manager.load_mining_history()
+        self.mining_history = self._merge_mining_history(self.data_manager.load_mining_history())
 
         # Ensure hashrate_callback is always defined
         self.hashrate_callback = None
@@ -752,6 +764,7 @@ class Miner:
         self.last_gpu_duration = 0.0
         self._last_hashing_status = 0.0
         self._reward_mode_cache = {"mode": None, "ts": 0.0}
+        self.peak_hashrate = 0.0
 
     def _resolve_reward_mode(self) -> str:
         """Resolve reward mode, preferring daemon configuration when available."""
@@ -785,6 +798,23 @@ class Miner:
         """Register a callback for mining status updates."""
         self.mining_status_callbacks.append(callback)
 
+    def _update_peak_hashrate(self, rate: float) -> None:
+        try:
+            if rate and rate > self.peak_hashrate:
+                self.peak_hashrate = float(rate)
+        except Exception:
+            pass
+
+    def _get_mempool_size(self) -> int:
+        try:
+            pending = self.mempool_manager.get_pending_transactions(fetch_remote=True)
+            return len(pending)
+        except Exception:
+            try:
+                return int(self.mempool_manager.get_mempool_size())
+            except Exception:
+                return 0
+
     def _emit_status(self, phase: str, message: str = "", payload: Optional[Dict] = None) -> None:
         data = {
             "phase": phase,
@@ -792,6 +822,10 @@ class Miner:
             "timestamp": time.time(),
             "engine": self.last_engine_used,
             "hash_rate": self.hash_rate or self.last_cpu_hashrate or self.last_gpu_hashrate,
+            "mempool_size": self._get_mempool_size(),
+            "peak_hashrate": self.peak_hashrate,
+            "blocks_mined": self.blocks_mined,
+            "total_reward": self.total_reward,
         }
         if payload:
             data.update(payload)
@@ -1121,7 +1155,7 @@ class Miner:
                 self.hashrate_callback(0.0, 'gpu')
             safe_print(f"[DEBUG] About to call cuda_manager.cuda_mine_batch with difficulty={difficulty}")
             status_interval = float(os.getenv("LUNALIB_MINER_STATUS_INTERVAL", "5"))
-            batch_size = int(getattr(self.config, "cuda_batch_size", 100000) or 100000)
+            batch_size = int(getattr(self.config, "cuda_batch_size", 1000000) or 1000000)
             env_batch = os.getenv("LUNALIB_CUDA_BATCH_SIZE")
             if env_batch:
                 try:
@@ -1133,6 +1167,7 @@ class Miner:
                 now = time.time()
                 self.hash_rate = float(update.get("hashrate", 0.0))
                 self.last_gpu_hashrate = self.hash_rate
+                self._update_peak_hashrate(self.hash_rate)
                 self.last_gpu_attempts = int(update.get("attempts", 0))
                 self.last_gpu_duration = float(update.get("duration", 0.0))
                 if now - self._last_hashing_status >= status_interval:
@@ -1164,6 +1199,7 @@ class Miner:
                 if mining_time > 0:
                     self.hash_rate = nonce / mining_time
                     self.last_gpu_hashrate = self.hash_rate
+                    self._update_peak_hashrate(self.hash_rate)
                     self.last_gpu_attempts = nonce
                     self.last_gpu_duration = mining_time
                     self.last_cpu_hashrate = 0.0
@@ -1238,6 +1274,7 @@ class Miner:
             self.last_cpu_attempts = result[0]['nonce']
             self.last_cpu_duration = elapsed
             self.last_cpu_hashrate = result[0]['nonce'] / elapsed if elapsed > 0 else 0.0
+            self._update_peak_hashrate(self.last_cpu_hashrate)
             safe_print(f"[DEBUG] [CPU] Final hashrate: {self.last_cpu_hashrate:,.0f} H/s, nonce={result[0]['nonce']}, elapsed={elapsed:.2f}s")
             if self.hashrate_callback:
                 self.hashrate_callback(self.last_cpu_hashrate, 'cpu')
@@ -1276,6 +1313,9 @@ class Miner:
                              transactions: List[Dict], nonce: int, miner: str, difficulty: int) -> str:
         """Calculate SHA-256 hash of a block matching server validation"""
         try:
+            hash_mode = os.getenv("LUNALIB_MINING_HASH_MODE", "json").lower()
+            if hash_mode == "compact":
+                return self._calculate_block_hash_compact(index, previous_hash, timestamp, nonce, miner, difficulty)
             block_data = {
                 "difficulty": int(difficulty),
                 "index": int(index),
@@ -1293,6 +1333,28 @@ class Miner:
 
         except Exception as e:
             safe_print(f"Hash calculation error: {e}")
+            return "0" * 64
+
+    def _calculate_block_hash_compact(self, index: int, previous_hash: str, timestamp: float,
+                                      nonce: int, miner: str, difficulty: int) -> str:
+        """Compact mining hash: fixed 88-byte header (80-byte base + 8-byte nonce)."""
+        try:
+            if len(previous_hash) != 64:
+                return "0" * 64
+            prev_bytes = bytes.fromhex(previous_hash)
+            miner_hash = sm3_digest(str(miner).encode())
+            base = (
+                prev_bytes
+                + int(index).to_bytes(4, "big", signed=False)
+                + int(difficulty).to_bytes(4, "big", signed=False)
+                + struct.pack(">d", float(timestamp))
+                + miner_hash
+            )
+            if len(base) != 80:
+                return "0" * 64
+            nonce_bytes = int(nonce).to_bytes(8, "big", signed=False)
+            return sm3_digest(base + nonce_bytes).hex()
+        except Exception:
             return "0" * 64
 
     def _finalize_block(self, block_data: Dict, method: str, total_reward: float) -> tuple[bool, str, Dict]:
@@ -1316,11 +1378,15 @@ class Miner:
 
         # Submit block to blockchain
         try:
-            self._emit_status("submitting", "Submitting mined block", {
-                "index": block_data.get("index"),
-                "method": method,
-            })
-            submission_success = self.blockchain_manager.submit_mined_block(block_data)
+            if os.getenv("LUNALIB_SKIP_SUBMIT", "0") == "1":
+                safe_print("[INFO] LUNALIB_SKIP_SUBMIT=1, skipping block submission")
+                submission_success = True
+            else:
+                self._emit_status("submitting", "Submitting mined block", {
+                    "index": block_data.get("index"),
+                    "method": method,
+                })
+                submission_success = self.blockchain_manager.submit_mined_block(block_data)
 
             if not submission_success:
                 safe_print(f"⚠️  Block #{block_data['index']} submission failed")
@@ -1331,13 +1397,6 @@ class Miner:
             self._emit_status("success", f"Block #{block_data['index']} submitted", {
                 "reward": final_reward,
             })
-
-            # 新規: ブロックがチェーンに追加されたことを通知
-            if self.block_added_callback:
-                try:
-                    self.block_added_callback(block_data)
-                except Exception as e:
-                    safe_print(f"[WARN] block_added_callback error: {e}")
 
             # Clear mined transactions from mempool
             self._clear_transactions_from_mempool(block_data['transactions'])
@@ -1360,7 +1419,9 @@ class Miner:
             'status': 'success'
         }
         self.mining_history.append(mining_record)
-        self.save_mining_history()
+
+        # 新規: ブロックがチェーンに追加されたことを通知
+        self._safe_callback(self.block_added_callback, "block_added_callback", block_data)
 
         self.blocks_mined += 1
         self.total_reward += final_reward
@@ -1368,8 +1429,9 @@ class Miner:
         if self.mining_completed_callback:
             self.mining_completed_callback(True, f"Block #{block_data['index']} mined - Reward: {final_reward}")
 
-        if self.block_mined_callback:
-            self.block_mined_callback(block_data)
+        self._safe_callback(self.block_mined_callback, "block_mined_callback", block_data)
+
+        self.save_mining_history()
 
         # --- Update bills.db, mined blocks, and mining stats ---
         try:
@@ -1483,9 +1545,69 @@ class Miner:
 
         return total_reward
 
+    def _safe_callback(self, callback: Optional[Callable], name: str, *args, **kwargs) -> bool:
+        """Safely invoke callback and return success status."""
+        if not callback:
+            return False
+        try:
+            callback(*args, **kwargs)
+            return True
+        except Exception as e:
+            safe_print(f"[WARN] {name} error: {e}")
+            return False
+
+    def _history_key(self, entry: Dict) -> Optional[tuple]:
+        """Build a unique key for mining history entries."""
+        if not isinstance(entry, dict):
+            return None
+        block_index = entry.get("block_index", entry.get("index"))
+        block_hash = entry.get("hash")
+        if block_index is None or not block_hash:
+            return None
+        return (block_index, block_hash)
+
+    def _merge_mining_history(self, *histories: List[Dict]) -> List[Dict]:
+        """Merge histories and deduplicate by block_index + hash."""
+        merged: Dict[tuple, Dict] = {}
+        for history in histories:
+            if not history:
+                continue
+            for entry in history:
+                key = self._history_key(entry)
+                if key is None:
+                    continue
+                existing = merged.get(key)
+                if not existing:
+                    merged[key] = entry
+                    continue
+                existing_ts = float(existing.get("timestamp", 0) or 0)
+                entry_ts = float(entry.get("timestamp", 0) or 0)
+                if entry_ts >= existing_ts:
+                    merged[key] = entry
+
+        return sorted(merged.values(), key=lambda e: float(e.get("timestamp", 0) or 0))
+
     def save_mining_history(self):
         """Save mining history to storage"""
-        self.data_manager.save_mining_history(self.mining_history)
+        try:
+            persisted = []
+            if hasattr(self.data_manager, "load_mining_history"):
+                persisted = self.data_manager.load_mining_history()
+            self.mining_history = self._merge_mining_history(persisted, self.mining_history)
+            self.data_manager.save_mining_history(self.mining_history)
+        except Exception as e:
+            safe_print(f"[WARN] save_mining_history failed: {e}")
+
+    def get_mining_history(self) -> List[Dict]:
+        """Return merged mining history (deduplicated)."""
+        try:
+            persisted = []
+            if hasattr(self.data_manager, "load_mining_history"):
+                persisted = self.data_manager.load_mining_history()
+            self.mining_history = self._merge_mining_history(persisted, self.mining_history)
+        except Exception as e:
+            safe_print(f"[WARN] get_mining_history failed: {e}")
+        return list(self.mining_history)
 
     def start_mining(self):
         """Start the mining process"""
@@ -1511,11 +1633,7 @@ class Miner:
             success, message, block = self.mine_block()
 
             if success:
-                if self.block_mined_callback:
-                    try:
-                        self.block_mined_callback(block)
-                    except Exception:
-                        pass
+                pass
             else:
                 # Avoid tight loop if mining is disabled/unavailable
                 time.sleep(0.25)
@@ -1525,7 +1643,16 @@ class Miner:
                 last_status = now
                 engine = self.last_engine_used or "none"
                 rate = self.hash_rate or self.last_cpu_hashrate
+                self._update_peak_hashrate(rate)
+                mempool_size = self._get_mempool_size()
                 safe_print(f"[MINER] engine={engine} rate={rate:,.0f} H/s nonce={self.current_nonce}")
+                safe_print(
+                    "[STATS] "
+                    f"mempool={mempool_size} "
+                    f"peak={self.peak_hashrate:,.0f} H/s "
+                    f"blocks={self.blocks_mined} "
+                    f"reward={self.total_reward:,.6f}"
+                )
 
     def stop_mining(self):
         """Stop the mining process"""
@@ -1542,6 +1669,8 @@ class Miner:
             "current_hash": self.current_hash,
             "current_nonce": self.current_nonce,
             "hash_rate": self.hash_rate,
+            "peak_hashrate": self.peak_hashrate,
+            "mempool_size": self._get_mempool_size(),
             "mining_history": len(self.mining_history),
             "last_engine_used": self.last_engine_used,
             "last_cpu_hashrate": self.last_cpu_hashrate,

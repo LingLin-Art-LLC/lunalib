@@ -1,0 +1,15 @@
+{
+  "mode": "gpu",
+  "profile": "steady",
+  "duration_seconds": 10.0,
+  "warmup_seconds": 5.0,
+  "batch_size": 100000,
+  "persistent": true,
+  "persistent_slice_seconds": 0.25,
+  "samples": 0,
+  "hashrate_min": 19594287472776.918,
+  "hashrate_avg": 19594287472776.918,
+  "hashrate_median": 19594287472776.918,
+  "hashrate_p95": 19594287472776.918,
+  "hashrate_max": 19594287472776.918
+}

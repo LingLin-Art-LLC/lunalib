@@ -9,7 +9,7 @@ class Config:
     difficulty = 3
     enable_gpu_mining = True
     enable_cpu_mining = True
-    cuda_batch_size = 100000
+    cuda_batch_size = 1000000
     multi_gpu_enabled = True
     cuda_sm3_kernel = True
 
@@ -39,6 +39,7 @@ def mining_status_callback(data):
 def main():
     os.environ.setdefault("LUNALIB_CUDA_SM3", "1")
     os.environ.setdefault("LUNALIB_MULTI_GPU", "1")
+    os.environ.setdefault("LUNALIB_MINING_HASH_MODE", "compact")
     config = Config()
     data_manager = DummyDataManager()
     miner = Miner(config, data_manager, block_mined_callback=block_mined_callback)

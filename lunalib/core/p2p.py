@@ -279,6 +279,9 @@ class P2PClient:
                 if current_time - self.last_primary_check > self.primary_check_interval:
                     self._validate_with_primary()
                 
+                # Sync with primary/base before peers
+                self._sync_from_primary()
+
                 # Sync with peers
                 self._sync_from_peers()
                 
@@ -290,6 +293,17 @@ class P2PClient:
             except Exception as e:
                 print(f"❌ Sync loop error: {e}")
                 time.sleep(10)
+
+    def _sync_from_primary(self):
+        """Sync latest block from primary/base URL before peers."""
+        try:
+            response = requests.get(f"{self.primary_node}/api/blockchain/latest", timeout=5)
+            if response.status_code == 200:
+                latest_block = response.json()
+                if self.on_new_block_callback:
+                    self.on_new_block_callback(latest_block)
+        except Exception:
+            pass
     
     def _sync_from_peers(self):
         """Sync new blocks and transactions from peers"""

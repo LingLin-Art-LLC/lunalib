@@ -1,0 +1,12 @@
+{
+  "mode": "gpu",
+  "duration_seconds": 60.0,
+  "warmup_seconds": 5.0,
+  "batch_size": 10000,
+  "samples": 60,
+  "hashrate_min": 155514.2847491529,
+  "hashrate_avg": 241021.03028232226,
+  "hashrate_median": 251400.20795384224,
+  "hashrate_p95": 268998.21179478033,
+  "hashrate_max": 270030.24290190125
+}

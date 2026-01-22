@@ -137,6 +137,20 @@ class BlockchainCache:
             safe_print(f"Cache read error: {e}")
             
         return None
+
+    def delete_block(self, height: int) -> None:
+        """Delete a cached block by height."""
+        try:
+            if self._use_indexeddb and self._idb:
+                self._idb.delete("blocks", str(height))
+                return
+            conn = sqlite3.connect(self.cache_file)
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM blocks WHERE height = ?', (height,))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            safe_print(f"Cache delete error: {e}")
     
     def get_block_range(self, start_height: int, end_height: int) -> List[Dict]:
         """Get multiple blocks from cache"""

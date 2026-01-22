@@ -30,7 +30,16 @@ def _refresh_tx_caches(self):
     from lunalib.core.mempool import MempoolManager
     blockchain = BlockchainManager()
     mempool = MempoolManager()
-    confirmed = blockchain.scan_transactions_for_address(self.current_wallet_address)
+    cache_only = os.getenv("LUNALIB_WALLET_SCAN_CACHE_ONLY", "1") == "1"
+    max_range = int(os.getenv("LUNALIB_WALLET_SCAN_MAX_RANGE", "500"))
+    confirmed = blockchain.scan_transactions_for_address_filtered(
+        self.current_wallet_address,
+        include_rewards=True,
+        include_transfers=True,
+        include_gtx_genesis=False,
+        cache_only=cache_only,
+        max_range=max_range if max_range > 0 else None,
+    )
     pending = mempool.get_pending_transactions(self.current_wallet_address, fetch_remote=True)
     norm = self._normalize_address(self.current_wallet_address)
     self._confirmed_tx_cache[self.current_wallet_address] = confirmed
@@ -280,7 +289,16 @@ class LunaWallet:
             from lunalib.core.blockchain import BlockchainManager
 
             blockchain = BlockchainManager()
-            confirmed = blockchain.scan_transactions_for_address(addr)
+            cache_only = os.getenv("LUNALIB_WALLET_SCAN_CACHE_ONLY", "1") == "1"
+            max_range = int(os.getenv("LUNALIB_WALLET_SCAN_MAX_RANGE", "500"))
+            confirmed = blockchain.scan_transactions_for_address_filtered(
+                addr,
+                include_rewards=True,
+                include_transfers=True,
+                include_gtx_genesis=False,
+                cache_only=cache_only,
+                max_range=max_range if max_range > 0 else None,
+            )
             self._confirmed_tx_cache[norm_addr] = confirmed
 
         if not pending:
@@ -697,8 +715,17 @@ class LunaWallet:
 
             blockchain = BlockchainManager()
             mempool = MempoolManager()
+            cache_only = os.getenv("LUNALIB_WALLET_SCAN_CACHE_ONLY", "1") == "1"
+            max_range = int(os.getenv("LUNALIB_WALLET_SCAN_MAX_RANGE", "500"))
 
-            confirmed_map = blockchain.scan_transactions_for_addresses(addresses)
+            confirmed_map = blockchain.scan_transactions_for_addresses_filtered(
+                addresses,
+                include_rewards=True,
+                include_transfers=True,
+                include_gtx_genesis=False,
+                cache_only=cache_only,
+                max_range=max_range if max_range > 0 else None,
+            )
             pending_map = mempool.get_pending_transactions_for_addresses(addresses, fetch_remote=True)
 
             # Reset caches with normalized + original keys
@@ -910,7 +937,16 @@ class LunaWallet:
             from lunalib.core.blockchain import BlockchainManager
 
             blockchain = BlockchainManager()
-            transactions = blockchain.scan_transactions_for_address(self.address)
+            cache_only = os.getenv("LUNALIB_WALLET_SCAN_CACHE_ONLY", "1") == "1"
+            max_range = int(os.getenv("LUNALIB_WALLET_SCAN_MAX_RANGE", "500"))
+            transactions = blockchain.scan_transactions_for_address_filtered(
+                self.address,
+                include_rewards=True,
+                include_transfers=True,
+                include_gtx_genesis=False,
+                cache_only=cache_only,
+                max_range=max_range if max_range > 0 else None,
+            )
             total_balance = self._compute_confirmed_balance(transactions)
             return total_balance
 
@@ -1231,10 +1267,19 @@ class LunaWallet:
                 from lunalib.core.mempool import MempoolManager
 
                 blockchain = BlockchainManager()
+                cache_only = os.getenv("LUNALIB_WALLET_SCAN_CACHE_ONLY", "1") == "1"
+                max_range = int(os.getenv("LUNALIB_WALLET_SCAN_MAX_RANGE", "500"))
                 mempool = MempoolManager()
 
                 # Get confirmed transactions from blockchain (includes mining rewards)
-                confirmed_txs = blockchain.scan_transactions_for_address(self.address)
+                confirmed_txs = blockchain.scan_transactions_for_address_filtered(
+                    self.address,
+                    include_rewards=True,
+                    include_transfers=True,
+                    include_gtx_genesis=False,
+                    cache_only=cache_only,
+                    max_range=max_range if max_range > 0 else None,
+                )
                 self._confirmed_tx_cache[self.address] = confirmed_txs
 
                 # Get pending transactions from mempool
@@ -1321,7 +1366,16 @@ class LunaWallet:
                 from lunalib.core.blockchain import BlockchainManager
 
                 blockchain = BlockchainManager()
-                confirmed_txs = blockchain.scan_transactions_for_address(address)
+                cache_only = os.getenv("LUNALIB_WALLET_SCAN_CACHE_ONLY", "1") == "1"
+                max_range = int(os.getenv("LUNALIB_WALLET_SCAN_MAX_RANGE", "500"))
+                confirmed_txs = blockchain.scan_transactions_for_address_filtered(
+                    address,
+                    include_rewards=True,
+                    include_transfers=True,
+                    include_gtx_genesis=False,
+                    cache_only=cache_only,
+                    max_range=max_range if max_range > 0 else None,
+                )
                 self._confirmed_tx_cache[norm_addr] = confirmed_txs
 
             if include_pending and not pending_txs:
@@ -1541,12 +1595,39 @@ class LunaWallet:
 
             # Get data from blockchain and mempool (single scan)
             end_height = blockchain.get_blockchain_height()
+            lookback = int(os.getenv("LUNALIB_WALLET_SYNC_LOOKBACK", "50"))
+            if lookback < 0:
+                lookback = 0
+            cache_only = os.getenv("LUNALIB_WALLET_SCAN_CACHE_ONLY", "1") == "1"
+            max_range = int(os.getenv("LUNALIB_WALLET_SCAN_MAX_RANGE", "500"))
             if end_height <= state_manager.last_blockchain_height:
-                blockchain_txs = {}
+                if lookback > 0:
+                    start_height = max(0, end_height - lookback + 1)
+                    blockchain_txs = blockchain.scan_transactions_for_addresses_filtered(
+                        addresses,
+                        start_height=start_height,
+                        end_height=end_height,
+                        include_rewards=True,
+                        include_transfers=True,
+                        include_gtx_genesis=False,
+                        cache_only=cache_only,
+                        max_range=max_range if max_range > 0 else None,
+                    )
+                else:
+                    blockchain_txs = {}
             else:
                 start_height = max(0, state_manager.last_blockchain_height + 1)
-                blockchain_txs = blockchain.scan_transactions_for_addresses(
-                    addresses, start_height=start_height, end_height=end_height
+                if lookback > 0:
+                    start_height = min(start_height, max(0, end_height - lookback + 1))
+                blockchain_txs = blockchain.scan_transactions_for_addresses_filtered(
+                    addresses,
+                    start_height=start_height,
+                    end_height=end_height,
+                    include_rewards=True,
+                    include_transfers=True,
+                    include_gtx_genesis=False,
+                    cache_only=cache_only,
+                    max_range=max_range if max_range > 0 else None,
                 )
             mempool_txs = mempool.get_pending_transactions_for_addresses(addresses)
 

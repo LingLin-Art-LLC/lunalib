@@ -67,6 +67,10 @@ lunalib/mining/__pycache__/__init__.cpython-310.pyc
 lunalib/mining/__pycache__/cuda_manager.cpython-310.pyc
 lunalib/mining/__pycache__/difficulty.cpython-310.pyc
 lunalib/mining/__pycache__/miner.cpython-310.pyc
+lunalib/mining/sm3_cuda/sm3_gpu.py
+lunalib/mining/sm3_cuda/sm3_kernel.cu
+lunalib/mining/sm3_cuda/sm3_kernel_constants.h
+lunalib/mining/sm3_cuda/sm3_kernel_utils.cu
 lunalib/storage/__init__.py
 lunalib/storage/cache.py
 lunalib/storage/database.py

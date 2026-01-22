@@ -6,6 +6,7 @@ Provides integration between LunaWallet, BlockchainManager, MempoolManager,
 and the WalletStateManager for seamless real-time balance and transaction updates.
 """
 
+import os
 from typing import List, Dict, Optional, Callable
 from .wallet_manager import get_wallet_manager
 
@@ -47,7 +48,7 @@ class WalletSyncHelper:
         
         return states
     
-    def sync_wallets_now(self) -> Dict:
+    def sync_wallets_now(self, on_scan_progress: Optional[Callable] = None) -> Dict:
         """
         Perform a single synchronization of all registered wallets.
         
@@ -66,11 +67,38 @@ class WalletSyncHelper:
         
         try:
             # Get data from blockchain and mempool
-            blockchain_txs = self.blockchain.scan_transactions_for_addresses(addresses)
+            end_height = self.blockchain.get_blockchain_height()
+            lookback = int(os.getenv("LUNALIB_WALLET_SYNC_LOOKBACK", "50"))
+            if lookback < 0:
+                lookback = 0
+            cache_only = os.getenv("LUNALIB_WALLET_SCAN_CACHE_ONLY", "1") == "1"
+            max_range = int(os.getenv("LUNALIB_WALLET_SCAN_MAX_RANGE", "500"))
+            if end_height <= self.state_manager.last_blockchain_height:
+                if lookback > 0:
+                    start_height = max(0, end_height - lookback + 1)
+                else:
+                    start_height = end_height
+            else:
+                start_height = max(0, self.state_manager.last_blockchain_height + 1)
+                if lookback > 0:
+                    start_height = min(start_height, max(0, end_height - lookback + 1))
+
+            blockchain_txs = self.blockchain.scan_transactions_for_addresses_filtered(
+                addresses,
+                start_height=start_height,
+                end_height=end_height,
+                include_rewards=True,
+                include_transfers=True,
+                include_gtx_genesis=False,
+                cache_only=cache_only,
+                max_range=max_range if max_range > 0 else None,
+                progress_callback=on_scan_progress,
+            )
             mempool_txs = self.mempool.get_pending_transactions_for_addresses(addresses)
             
             # Sync the state manager
             self.state_manager.sync_wallets_from_sources(blockchain_txs, mempool_txs)
+            self.state_manager.last_blockchain_height = end_height
             
             # Update LunaWallet balances if available
             if self.wallet:
@@ -104,7 +132,8 @@ class WalletSyncHelper:
     
     def start_continuous_sync(self, poll_interval: int = 30,
                              on_balance_update: Optional[Callable] = None,
-                             on_transaction_update: Optional[Callable] = None) -> None:
+                             on_transaction_update: Optional[Callable] = None,
+                             on_scan_progress: Optional[Callable] = None) -> None:
         """
         Start continuous synchronization in the background.
         
@@ -122,7 +151,34 @@ class WalletSyncHelper:
         
         def get_blockchain_data(addresses):
             try:
-                return self.blockchain.scan_transactions_for_addresses(addresses)
+                end_height = self.blockchain.get_blockchain_height()
+                lookback = int(os.getenv("LUNALIB_WALLET_SYNC_LOOKBACK", "50"))
+                if lookback < 0:
+                    lookback = 0
+                cache_only = os.getenv("LUNALIB_WALLET_SCAN_CACHE_ONLY", "1") == "1"
+                max_range = int(os.getenv("LUNALIB_WALLET_SCAN_MAX_RANGE", "500"))
+                if end_height <= self.state_manager.last_blockchain_height:
+                    if lookback > 0:
+                        start_height = max(0, end_height - lookback + 1)
+                    else:
+                        start_height = end_height
+                else:
+                    start_height = max(0, self.state_manager.last_blockchain_height + 1)
+                    if lookback > 0:
+                        start_height = min(start_height, max(0, end_height - lookback + 1))
+                data = self.blockchain.scan_transactions_for_addresses_filtered(
+                    addresses,
+                    start_height=start_height,
+                    end_height=end_height,
+                    include_rewards=True,
+                    include_transfers=True,
+                    include_gtx_genesis=False,
+                    cache_only=cache_only,
+                    max_range=max_range if max_range > 0 else None,
+                    progress_callback=on_scan_progress,
+                )
+                self.state_manager.last_blockchain_height = end_height
+                return data
             except Exception as e:
                 print(f"⚠️  Blockchain scan error: {e}")
                 return {}

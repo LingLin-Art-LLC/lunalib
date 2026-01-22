@@ -36,6 +36,31 @@ class BlockchainManager:
             return ''
         addr_str = str(addr).strip("'\" ").lower()
         return addr_str[4:] if addr_str.startswith('lun_') else addr_str
+
+    def _extract_miner_address(self, block: Dict) -> str:
+        """Extract miner address from a block using known aliases."""
+        return (
+            block.get('miner')
+            or block.get('mined_by')
+            or block.get('miner_address')
+            or block.get('mined_by_address')
+            or block.get('minerAddress')
+            or block.get('minedBy')
+            or ''
+        )
+
+    def _extract_reward_amount(self, block: Dict) -> float:
+        """Extract reward amount from block metadata using known aliases."""
+        reward_raw = (
+            block.get('reward')
+            or block.get('reward_amount')
+            or block.get('block_reward')
+            or block.get('mining_reward')
+            or block.get('miner_reward')
+            or block.get('rewardAmount')
+            or block.get('blockReward')
+        )
+        return self._parse_amount(reward_raw or 0)
         
     def broadcast_transaction_async(self, transaction: Dict, callback: Callable = None) -> str:
         """Async version: Broadcast transaction in background thread
@@ -298,6 +323,42 @@ class BlockchainManager:
                     return default
         return default
 
+    def _is_reward_tx(self, tx: Dict) -> bool:
+        tx_type = str(tx.get("type") or "").lower()
+        desc = str(tx.get("description") or "").lower()
+        return (
+            tx_type in {"reward", "coinbase", "mining_reward"}
+            or str(tx.get("hash", "")).startswith("reward_")
+            or (str(tx.get("from", "")) == "network" and ("reward" in desc or "mining" in desc))
+            or (str(tx.get("from", "")) == "network" and tx.get("block_height") is not None)
+            or ("reward" in tx)
+        )
+
+    def _is_gtx_genesis_tx(self, tx: Dict) -> bool:
+        tx_type = str(tx.get("type") or "").lower()
+        return tx_type in {"gtx_genesis", "genesis_bill", "gtxgenesis"}
+
+    def _filter_transactions(
+        self,
+        txs: List[Dict],
+        include_rewards: bool,
+        include_transfers: bool,
+        include_gtx_genesis: bool,
+    ) -> List[Dict]:
+        filtered: List[Dict] = []
+        for tx in txs:
+            if self._is_reward_tx(tx):
+                if include_rewards:
+                    filtered.append(tx)
+                continue
+            if self._is_gtx_genesis_tx(tx):
+                if include_gtx_genesis:
+                    filtered.append(tx)
+                continue
+            if include_transfers:
+                filtered.append(tx)
+        return filtered
+
     def _fetch_blocks_list(self) -> List[Dict]:
         try:
             response = self._session.get(f'{self.endpoint_url}/blockchain/blocks', timeout=10)
@@ -403,7 +464,7 @@ class BlockchainManager:
         print(f"🔄 Started async blocks fetch: {task_id}")
         return task_id
     
-    def get_blocks_range(self, start_height: int, end_height: int) -> List[Dict]:
+    def get_blocks_range(self, start_height: int, end_height: int, cache_only: bool = False) -> List[Dict]:
         """Get range of blocks (uses cache and fetches only missing blocks)"""
         blocks = []
 
@@ -415,9 +476,24 @@ class BlockchainManager:
             if isinstance(height, int):
                 cached_by_height[height] = block
 
+        tail_refresh = int(os.getenv("LUNALIB_CACHE_TAIL_REFRESH", "25"))
+        if tail_refresh < 0:
+            tail_refresh = 0
+        if tail_refresh:
+            tail_start = max(start_height, end_height - tail_refresh + 1)
+            for height in range(tail_start, end_height + 1):
+                cached_by_height.pop(height, None)
+                try:
+                    self.cache.delete_block(height)
+                except Exception:
+                    pass
+
         expected_count = (end_height - start_height + 1)
         if len(cached_by_height) == expected_count:
             return [cached_by_height[h] for h in range(start_height, end_height + 1)]
+
+        if cache_only:
+            return [cached_by_height[h] for h in range(start_height, end_height + 1) if h in cached_by_height]
 
         missing_heights = [
             h for h in range(start_height, end_height + 1) if h not in cached_by_height
@@ -437,12 +513,42 @@ class BlockchainManager:
                         self.cache.save_block(height, block.get('hash', ''), block)
                     return blocks
 
-            # Fallback: fetch missing blocks individually
-            for height in tqdm(missing_heights, desc="Get Blocks", leave=False):
-                block = self.get_block(height)
-                if block:
-                    cached_by_height[height] = block
-                time.sleep(0.01)  # Be nice to the API
+            # Fallback: fetch missing blocks individually (optionally in parallel)
+            fetch_delay = float(os.getenv("LUNALIB_BLOCK_FETCH_DELAY", "0"))
+            max_workers = int(os.getenv("LUNALIB_BLOCK_FETCH_WORKERS", "4"))
+            if max_workers < 1:
+                max_workers = 1
+
+            def _fetch_one(height: int) -> Optional[Dict]:
+                cached = self.cache.get_block(height)
+                if cached:
+                    return cached
+                if fetch_delay > 0:
+                    time.sleep(fetch_delay)
+                try:
+                    response = requests.get(f'{self.endpoint_url}/blockchain/block/{height}', timeout=10)
+                    if response.status_code == 200:
+                        block = response.json()
+                        self.cache.save_block(height, block.get('hash', ''), block)
+                        return block
+                except Exception:
+                    return None
+                return None
+
+            if max_workers == 1 or len(missing_heights) < 2:
+                for height in tqdm(missing_heights, desc="Get Blocks", leave=False):
+                    block = _fetch_one(height)
+                    if block:
+                        cached_by_height[height] = block
+            else:
+                futures = [self.executor.submit(_fetch_one, height) for height in missing_heights]
+                for height, future in tqdm(list(zip(missing_heights, futures)), desc="Get Blocks", leave=False):
+                    try:
+                        block = future.result()
+                    except Exception:
+                        block = None
+                    if block:
+                        cached_by_height[height] = block
 
         except Exception as e:
             print(f"Get blocks range error: {e}")
@@ -470,22 +576,88 @@ class BlockchainManager:
             self.network_connected = False
             return False
     
-    def scan_transactions_for_address(self, address: str, start_height: int = 0, end_height: int = None) -> List[Dict]:
+    def scan_transactions_for_address(
+        self,
+        address: str,
+        start_height: int = 0,
+        end_height: int = None,
+        cache_only: bool = False,
+        max_range: Optional[int] = None,
+        progress_callback: Optional[Callable] = None,
+    ) -> List[Dict]:
         """Scan blockchain for transactions involving an address"""
         if end_height is None:
             end_height = self.get_blockchain_height()
 
+        if max_range and end_height - start_height + 1 > max_range:
+            start_height = max(0, end_height - max_range + 1)
+
         print(f"[SCAN] Scanning transactions for {address} from block {start_height} to {end_height}")
 
         transactions = []
-        batch_size = 100
+        batch_size = int(os.getenv("LUNALIB_SCAN_BATCH_SIZE", "200"))
+        if batch_size < 1:
+            batch_size = 200
         total_batches = ((end_height - start_height) // batch_size) + 1
+        batch_index = 0
+        skip_full_fetch = os.getenv("LUNALIB_SCAN_SKIP_FULL_BLOCK_FETCH", "0") == "1"
         for batch_start in tqdm(range(start_height, end_height + 1, batch_size), desc=f"Scan {address}", total=total_batches):
             batch_end = min(batch_start + batch_size - 1, end_height)
-            blocks = self.get_blocks_range(batch_start, batch_end)
+            if progress_callback:
+                progress_callback({
+                    "stage": "scan",
+                    "scope": "address",
+                    "address": address,
+                    "batch_index": batch_index,
+                    "batch_total": total_batches,
+                    "start_height": start_height,
+                    "end_height": end_height,
+                    "batch_start": batch_start,
+                    "batch_end": batch_end,
+                    "cache_only": cache_only,
+                })
+            blocks = self.get_blocks_range(batch_start, batch_end, cache_only=cache_only)
             for block in blocks:
+                if not isinstance(block, dict):
+                    resolved = None
+                    if isinstance(block, (int, str)):
+                        resolved = self.get_block(block)
+                    if isinstance(resolved, dict):
+                        block = resolved
+                    else:
+                        continue
+
+                height = block.get('index', block.get('height'))
+                has_txs = isinstance(block.get('transactions'), list)
+                has_meta = bool(self._extract_miner_address(block)) or (self._extract_reward_amount(block) > 0)
+                if not skip_full_fetch and (not has_txs or not has_meta):
+                    full_block = None
+                    if cache_only:
+                        if isinstance(height, int):
+                            full_block = self.cache.get_block(height)
+                    else:
+                        if isinstance(height, int):
+                            full_block = self.get_block(height)
+                        elif block.get('hash'):
+                            full_block = self.get_block(block.get('hash'))
+                    if isinstance(full_block, dict):
+                        block = full_block
                 block_transactions = self._find_address_transactions(block, address)
                 transactions.extend(block_transactions)
+            batch_index += 1
+            if progress_callback:
+                progress_callback({
+                    "stage": "scan",
+                    "scope": "address",
+                    "address": address,
+                    "batch_index": batch_index,
+                    "batch_total": total_batches,
+                    "start_height": start_height,
+                    "end_height": end_height,
+                    "scanned_end": batch_end,
+                    "tx_count": len(transactions),
+                    "cache_only": cache_only,
+                })
 
         max_tx = int(os.getenv("LUNALIB_SCAN_TX_LIMIT", "5000"))
         if max_tx > 0 and len(transactions) > max_tx:
@@ -520,7 +692,15 @@ class BlockchainManager:
         print(f"🔄 Started async scan task: {task_id}")
         return task_id
 
-    def scan_transactions_for_addresses(self, addresses: List[str], start_height: int = 0, end_height: int = None) -> Dict[str, List[Dict]]:
+    def scan_transactions_for_addresses(
+        self,
+        addresses: List[str],
+        start_height: int = 0,
+        end_height: int = None,
+        cache_only: bool = False,
+        max_range: Optional[int] = None,
+        progress_callback: Optional[Callable] = None,
+    ) -> Dict[str, List[Dict]]:
         """Scan the blockchain once for multiple addresses (rewards and transfers)."""
         if not addresses:
             return {}
@@ -530,6 +710,9 @@ class BlockchainManager:
 
         if end_height < start_height:
             return {addr: [] for addr in addresses}
+
+        if max_range and end_height - start_height + 1 > max_range:
+            start_height = max(0, end_height - max_range + 1)
 
         print(f"[MULTI-SCAN] Scanning {len(addresses)} addresses from block {start_height} to {end_height}")
 
@@ -542,18 +725,59 @@ class BlockchainManager:
 
         results: Dict[str, List[Dict]] = {addr: [] for addr in addresses}
 
-        batch_size = 100
+        batch_size = int(os.getenv("LUNALIB_SCAN_BATCH_SIZE", "200"))
+        if batch_size < 1:
+            batch_size = 200
         total_batches = ((end_height - start_height) // batch_size) + 1
+        batch_index = 0
+        skip_full_fetch = os.getenv("LUNALIB_SCAN_SKIP_FULL_BLOCK_FETCH", "0") == "1"
         for batch_start in tqdm(range(start_height, end_height + 1, batch_size), desc="Multi-Scan", total=total_batches):
             batch_end = min(batch_start + batch_size - 1, end_height)
-            blocks = self.get_blocks_range(batch_start, batch_end)
+            if progress_callback:
+                progress_callback({
+                    "stage": "scan",
+                    "scope": "multi",
+                    "addresses": len(addresses),
+                    "batch_index": batch_index,
+                    "batch_total": total_batches,
+                    "start_height": start_height,
+                    "end_height": end_height,
+                    "batch_start": batch_start,
+                    "batch_end": batch_end,
+                    "cache_only": cache_only,
+                })
+            blocks = self.get_blocks_range(batch_start, batch_end, cache_only=cache_only)
             for block in blocks:
+                if not isinstance(block, dict):
+                    resolved = None
+                    if isinstance(block, (int, str)):
+                        resolved = self.get_block(block)
+                    if isinstance(resolved, dict):
+                        block = resolved
+                    else:
+                        continue
+
+                height = block.get('index', block.get('height'))
+                has_txs = isinstance(block.get('transactions'), list)
+                has_meta = bool(self._extract_miner_address(block)) or (self._extract_reward_amount(block) > 0)
+                if not skip_full_fetch and (not has_txs or not has_meta):
+                    full_block = None
+                    if cache_only:
+                        if isinstance(height, int):
+                            full_block = self.cache.get_block(height)
+                    else:
+                        if isinstance(height, int):
+                            full_block = self.get_block(height)
+                        elif block.get('hash'):
+                            full_block = self.get_block(block.get('hash'))
+                    if isinstance(full_block, dict):
+                        block = full_block
                 collected = self._collect_transactions_for_addresses(block, normalized_map)
                 # Fallback: ensure miner reward is captured even if block shape differs
                 try:
-                    miner_raw = block.get('miner') or block.get('mined_by') or block.get('miner_address') or block.get('mined_by_address')
+                    miner_raw = self._extract_miner_address(block)
                     miner_norm = self._normalize_address(miner_raw or '')
-                    reward_amount = self._parse_amount(block.get('reward', 0) or 0)
+                    reward_amount = self._extract_reward_amount(block)
                     if miner_norm in normalized_map and reward_amount > 0:
                         target_addr = normalized_map[miner_norm]
                         reward_hash = f"reward_{block.get('index')}_{block.get('hash', '')[:8]}"
@@ -579,6 +803,21 @@ class BlockchainManager:
                 for original_addr, txs in collected.items():
                     if txs:
                         results[original_addr].extend(txs)
+            batch_index += 1
+            if progress_callback:
+                total_txs = sum(len(txs) for txs in results.values())
+                progress_callback({
+                    "stage": "scan",
+                    "scope": "multi",
+                    "addresses": len(addresses),
+                    "batch_index": batch_index,
+                    "batch_total": total_batches,
+                    "start_height": start_height,
+                    "end_height": end_height,
+                    "scanned_end": batch_end,
+                    "tx_count": total_txs,
+                    "cache_only": cache_only,
+                })
 
         max_tx = int(os.getenv("LUNALIB_SCAN_TX_LIMIT", "5000"))
         if max_tx > 0:
@@ -595,6 +834,67 @@ class BlockchainManager:
             print(f"  - {addr}: {len(results[addr])} transactions")
 
         return results
+
+    def scan_transactions_for_addresses_filtered(
+        self,
+        addresses: List[str],
+        start_height: int = 0,
+        end_height: int = None,
+        include_rewards: bool = True,
+        include_transfers: bool = True,
+        include_gtx_genesis: bool = True,
+        cache_only: bool = False,
+        max_range: Optional[int] = None,
+        progress_callback: Optional[Callable] = None,
+    ) -> Dict[str, List[Dict]]:
+        """Scan blockchain and filter results by transaction category."""
+        results = self.scan_transactions_for_addresses(
+            addresses,
+            start_height,
+            end_height,
+            cache_only=cache_only,
+            max_range=max_range,
+            progress_callback=progress_callback,
+        )
+        if include_rewards and include_transfers and include_gtx_genesis:
+            return results
+        filtered: Dict[str, List[Dict]] = {}
+        for addr, txs in results.items():
+            filtered_txs = self._filter_transactions(
+                txs,
+                include_rewards=include_rewards,
+                include_transfers=include_transfers,
+                include_gtx_genesis=include_gtx_genesis,
+            )
+            if filtered_txs:
+                filtered[addr] = filtered_txs
+        return filtered
+
+    def scan_transactions_for_address_filtered(
+        self,
+        address: str,
+        start_height: int = 0,
+        end_height: int = None,
+        include_rewards: bool = True,
+        include_transfers: bool = True,
+        include_gtx_genesis: bool = True,
+        cache_only: bool = False,
+        max_range: Optional[int] = None,
+        progress_callback: Optional[Callable] = None,
+    ) -> List[Dict]:
+        """Scan blockchain for a single address with category filters."""
+        results = self.scan_transactions_for_addresses_filtered(
+            [address],
+            start_height=start_height,
+            end_height=end_height,
+            include_rewards=include_rewards,
+            include_transfers=include_transfers,
+            include_gtx_genesis=include_gtx_genesis,
+            cache_only=cache_only,
+            max_range=max_range,
+            progress_callback=progress_callback,
+        )
+        return results.get(address, [])
     
     def scan_transactions_for_addresses_async(self, addresses: List[str], callback: Callable = None,
                                              start_height: int = 0, end_height: int = None) -> str:
@@ -950,10 +1250,10 @@ class BlockchainManager:
         results: Dict[str, List[Dict]] = {original: [] for original in normalized_map.values()}
 
         # Mining reward via block metadata (support aliases)
-        miner_raw = block.get('miner') or block.get('mined_by') or block.get('miner_address') or block.get('mined_by_address')
+        miner_raw = self._extract_miner_address(block)
         miner_norm = self._normalize_address(miner_raw or '')
         if miner_norm in normalized_map:
-            reward_amount = self._parse_amount(block.get('reward', 0) or 0)
+            reward_amount = self._extract_reward_amount(block)
             if reward_amount > 0:
                 target_addr = normalized_map[miner_norm]
                 reward_tx = {
@@ -978,13 +1278,22 @@ class BlockchainManager:
             from_norm = self._normalize_address(tx.get('from') or tx.get('sender') or '')
             to_norm = self._normalize_address(tx.get('to') or tx.get('receiver') or '')
 
+            desc = str(tx.get('description', '') or '').lower()
+            reward_hint = (
+                tx_type in {'reward', 'coinbase', 'mining_reward'}
+                or (tx.get('hash', '') or '').startswith('reward_')
+                or (tx.get('from') == 'network' and ('reward' in desc or 'mining' in desc))
+                or (tx.get('from') == 'network' and tx.get('block_height') is not None)
+                or ('reward' in tx)
+            )
+
             # Explicit reward transaction (support aliases)
-            if tx_type == 'reward':
+            if reward_hint:
                 reward_to = tx.get('to') or tx.get('receiver') or tx.get('issued_to') or tx.get('owner_address') or tx.get('to_address')
                 reward_to_norm = self._normalize_address(reward_to or '')
                 if reward_to_norm in normalized_map:
                     target_addr = normalized_map[reward_to_norm]
-                    amount = self._parse_amount(tx.get('amount', tx.get('denomination', 0) or 0) or 0)
+                    amount = self._parse_amount(tx.get('amount', tx.get('denomination', tx.get('reward', 0)) or 0) or 0)
                     enhanced = tx.copy()
                     enhanced.update({
                         'to': reward_to,
@@ -1048,13 +1357,13 @@ class BlockchainManager:
         # ==================================================================
         # 1. CHECK BLOCK MINING REWARD (from block metadata)
         # ==================================================================
-        miner = block.get('miner') or block.get('mined_by') or block.get('miner_address') or block.get('mined_by_address') or ''
+        miner = self._extract_miner_address(block) or ''
         # Clean the miner address (remove quotes, trim)
         miner_clean = str(miner).strip('"\' ')
         
         print(f"   Miner in block: '{miner_clean}'")
         print(f"   Our address: '{address_lower}'")
-        print(f"   Block reward: {block.get('reward', 0)}")
+        print(f"   Block reward: {self._extract_reward_amount(block)}")
         
         # Function to normalize addresses for comparison
         def normalize_address(addr):
@@ -1076,7 +1385,7 @@ class BlockchainManager:
         
         # Check if this block was mined by our address
         if miner_normalized == address_normalized and miner_normalized:
-            reward_amount = self._parse_amount(block.get('reward', 0))
+            reward_amount = self._extract_reward_amount(block)
             if reward_amount > 0:
                 reward_tx = {
                     'type': 'reward',
@@ -1129,11 +1438,11 @@ class BlockchainManager:
             # A) REWARD TRANSACTIONS (explicit reward transactions)
             # ==================================================================
             tx_type = tx.get('type', 'transfer').lower()
-            if tx_type == 'reward':
+            if tx_type in {'reward', 'coinbase', 'mining_reward'}:
                 reward_to_address = tx.get('to') or tx.get('receiver') or tx.get('issued_to') or tx.get('owner_address') or tx.get('to_address') or ''
                 # Compare the reward's destination with our wallet address
                 if addresses_match(reward_to_address, address):
-                    amount = self._parse_amount(tx.get('amount', tx.get('denomination', 0) or 0))
+                    amount = self._parse_amount(tx.get('amount', tx.get('denomination', tx.get('reward', 0)) or 0))
                     enhanced_tx['direction'] = 'incoming'
                     enhanced_tx['effective_amount'] = amount
                     enhanced_tx['fee'] = 0
