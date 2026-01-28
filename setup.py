@@ -49,7 +49,7 @@ sm3_ext = Extension(
 
 setup(
     name="lunalib",
-    version="2.5.3",
+    version="2.6.0",
     author_email="taellinglin@gmail.com",
     description="Cryptocurrency Ecosystem library (LunaLib) by Sanny and Ling Lin",
     long_description="A modular cryptocurrency ecosystem library including blockchain, wallet, mining, storage, and transaction management.",

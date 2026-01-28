@@ -108,6 +108,87 @@ class BlockchainDaemon:
                 except Exception:
                     return default
         return default
+
+    def _is_tx_in_recent_chain(self, tx_hash: str) -> bool:
+        """Check if a transaction hash already exists in recent blockchain history."""
+        if not tx_hash:
+            return False
+        try:
+            depth = int(os.getenv("LUNALIB_TX_DEDUP_DEPTH", "1000"))
+        except Exception:
+            depth = 1000
+        if depth <= 0:
+            return False
+        try:
+            current_height = self.blockchain.get_blockchain_height()
+        except Exception:
+            return False
+        start_height = max(0, current_height - depth + 1)
+        for height in range(current_height, start_height - 1, -1):
+            try:
+                block = self.blockchain.get_block(height)
+            except Exception:
+                block = None
+            if not block:
+                continue
+            try:
+                if hasattr(self.blockchain, "_extract_block_transactions"):
+                    txs = self.blockchain._extract_block_transactions(block)
+                else:
+                    txs = block.get("transactions", [])
+            except Exception:
+                txs = block.get("transactions", []) if isinstance(block, dict) else []
+            for tx in txs or []:
+                if not isinstance(tx, dict):
+                    continue
+                if tx.get("hash") == tx_hash:
+                    return True
+        return False
+
+    def _is_gtx_serial_in_recent_chain(self, bill_serial: str) -> bool:
+        """Check if a GTX bill serial already exists in recent blockchain history."""
+        if not bill_serial:
+            return False
+        try:
+            depth = int(os.getenv("LUNALIB_GTX_DEDUP_DEPTH", "2000"))
+        except Exception:
+            depth = 2000
+        if depth <= 0:
+            return False
+        try:
+            current_height = self.blockchain.get_blockchain_height()
+        except Exception:
+            return False
+        start_height = max(0, current_height - depth + 1)
+        for height in range(current_height, start_height - 1, -1):
+            try:
+                block = self.blockchain.get_block(height)
+            except Exception:
+                block = None
+            if not block:
+                continue
+            try:
+                if hasattr(self.blockchain, "_extract_block_transactions"):
+                    txs = self.blockchain._extract_block_transactions(block)
+                else:
+                    txs = block.get("transactions", [])
+            except Exception:
+                txs = block.get("transactions", []) if isinstance(block, dict) else []
+            for tx in txs or []:
+                if not isinstance(tx, dict):
+                    continue
+                tx_type = str(tx.get("type") or "").lower()
+                if tx_type not in {"gtx_genesis", "genesis_bill"}:
+                    continue
+                existing = (
+                    tx.get("bill_serial")
+                    or tx.get("front_serial")
+                    or tx.get("serial")
+                    or tx.get("serial_number")
+                )
+                if existing == bill_serial:
+                    return True
+        return False
     
     def start(self):
         """Start the blockchain daemon"""
@@ -318,6 +399,46 @@ class BlockchainDaemon:
             non_reward_txs = [tx for tx in transactions if tx.get('type') != 'reward']
             is_empty_block = not non_reward_txs or (len(transactions) == 1 and reward_tx and reward_tx.get('is_empty_block', False))
             tx_count = len(non_reward_txs)
+
+            # Reject duplicate transactions (within block or already confirmed)
+            seen_hashes: set[str] = set()
+            seen_gtx_serials: set[str] = set()
+            for tx in non_reward_txs:
+                if not isinstance(tx, dict):
+                    continue
+                tx_hash = tx.get("hash")
+                if not tx_hash:
+                    errors.append("Transaction missing hash")
+                    continue
+                if tx_hash in seen_hashes:
+                    errors.append(f"Duplicate transaction hash in block: {tx_hash[:16]}...")
+                    continue
+                seen_hashes.add(tx_hash)
+                if hasattr(self.mempool, "is_transaction_confirmed") and self.mempool.is_transaction_confirmed(tx_hash):
+                    errors.append(f"Transaction already confirmed: {tx_hash[:16]}...")
+                    continue
+                if self._is_tx_in_recent_chain(tx_hash):
+                    errors.append(f"Transaction already in blockchain: {tx_hash[:16]}...")
+                    continue
+
+                tx_type = str(tx.get("type") or "").lower()
+                if tx_type in {"gtx_genesis", "genesis_bill"}:
+                    bill_serial = (
+                        tx.get("bill_serial")
+                        or tx.get("front_serial")
+                        or tx.get("serial")
+                        or tx.get("serial_number")
+                    )
+                    if not bill_serial:
+                        errors.append("GTX bill missing serial")
+                        continue
+                    if bill_serial in seen_gtx_serials:
+                        errors.append(f"Duplicate GTX bill serial in block: {bill_serial}")
+                        continue
+                    seen_gtx_serials.add(bill_serial)
+                    if self._is_gtx_serial_in_recent_chain(bill_serial):
+                        errors.append(f"GTX bill already in blockchain: {bill_serial}")
+                        continue
 
             fees_total = 0.0
             for tx in non_reward_txs:

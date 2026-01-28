@@ -5,6 +5,7 @@ from typing import Optional, Tuple, Dict, Any, List
 _ADDRESS_RE = re.compile(r"^LUN_[A-Za-z0-9_]{1,64}$", re.IGNORECASE)
 _HEX_RE = re.compile(r"^[0-9a-f]+$", re.IGNORECASE)
 _HTML_TAG_RE = re.compile(r"<[^>]*>")
+_GTX_SERIAL_RE = re.compile(r"^GTX-[0-9]+(?:\.[0-9]+)?-[0-9]{8}-[A-Z2-7]{10,32}$")
 
 MAX_TEXT_LEN = 256
 MAX_LABEL_LEN = 128
@@ -76,6 +77,13 @@ def is_valid_tx_hash(value: Optional[str]) -> bool:
     return _is_hex(value, 64)
 
 
+def is_valid_gtx_serial(value: Optional[str]) -> bool:
+    if value is None:
+        return False
+    text = str(value).strip()
+    return bool(_GTX_SERIAL_RE.fullmatch(text))
+
+
 def validate_wallet_import(wallet_data: Any) -> Tuple[bool, str]:
     if not isinstance(wallet_data, dict):
         return False, "Wallet payload must be an object"
@@ -145,14 +153,20 @@ def validate_transaction_payload(transaction: Any, max_memo_len: int = MAX_MEMO_
 def validate_gtx_genesis_payload(transaction: Any) -> Tuple[bool, str]:
     if not isinstance(transaction, dict):
         return False, "Genesis payload must be an object"
-    required = ["bill_serial", "denomination", "mining_difficulty", "hash", "nonce"]
+    required = ["denomination", "mining_difficulty", "hash", "nonce"]
     for field in required:
         if field not in transaction:
             return False, f"Missing GTX field: {field}"
 
-    bill_serial = transaction.get("bill_serial")
-    if not is_safe_text(bill_serial, max_len=128):
+    bill_serial = (
+        transaction.get("bill_serial")
+        or transaction.get("serial_number")
+        or transaction.get("front_serial")
+    )
+    if not bill_serial or not is_safe_text(bill_serial, max_len=128):
         return False, "Invalid bill serial"
+    if not is_valid_gtx_serial(bill_serial):
+        return False, "Invalid GTX serial format"
 
     denom = transaction.get("denomination")
     valid_denominations = [1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000]

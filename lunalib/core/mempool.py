@@ -175,6 +175,20 @@ class MempoolManager:
                 if self.verbose:
                     print("DEBUG: Transaction validation failed")
                 return False
+
+            # Reject duplicate GTX genesis bills by serial (pending or confirmed)
+            tx_type = str(transaction.get("type") or "").lower()
+            if tx_type in {"gtx_genesis", "genesis_bill"}:
+                bill_serial = (
+                    transaction.get("bill_serial")
+                    or transaction.get("front_serial")
+                    or transaction.get("serial")
+                    or transaction.get("serial_number")
+                )
+                if bill_serial and self._has_gtx_serial(bill_serial):
+                    if self.verbose:
+                        print(f"DEBUG: Duplicate GTX bill serial ignored: {bill_serial}")
+                    return True
             
             # Add to local mempool
             self.local_mempool[tx_hash] = {
@@ -206,6 +220,26 @@ class MempoolManager:
                 print(f"DEBUG: Error adding transaction to mempool: {e}")
             return False
 
+    def _has_gtx_serial(self, bill_serial: str) -> bool:
+        if not bill_serial:
+            return False
+        for item in self.local_mempool.values():
+            try:
+                tx = item.get("transaction")
+                if not isinstance(tx, dict):
+                    continue
+                existing = (
+                    tx.get("bill_serial")
+                    or tx.get("front_serial")
+                    or tx.get("serial")
+                    or tx.get("serial_number")
+                )
+                if existing == bill_serial:
+                    return True
+            except Exception:
+                continue
+        return False
+
     def add_transactions_batch(self, transactions: List[Dict]) -> Dict[str, int]:
         """Add a batch of transactions to the local mempool and broadcast as batch."""
         accepted = 0
@@ -217,6 +251,16 @@ class MempoolManager:
                 continue
             if not self._validate_transaction_basic(tx):
                 continue
+            tx_type = str(tx.get("type") or "").lower()
+            if tx_type in {"gtx_genesis", "genesis_bill"}:
+                bill_serial = (
+                    tx.get("bill_serial")
+                    or tx.get("front_serial")
+                    or tx.get("serial")
+                    or tx.get("serial_number")
+                )
+                if bill_serial and self._has_gtx_serial(bill_serial):
+                    continue
             self.local_mempool[tx_hash] = {
                 "transaction": tx,
                 "timestamp": time.time(),
@@ -249,6 +293,16 @@ class MempoolManager:
                 continue
             if self._is_zero_amount_transfer(tx):
                 continue
+            tx_type = str(tx.get("type") or "").lower()
+            if tx_type in {"gtx_genesis", "genesis_bill"}:
+                bill_serial = (
+                    tx.get("bill_serial")
+                    or tx.get("front_serial")
+                    or tx.get("serial")
+                    or tx.get("serial_number")
+                )
+                if bill_serial and self._has_gtx_serial(bill_serial):
+                    continue
             self.local_mempool[tx_hash] = {
                 "transaction": tx,
                 "timestamp": time.time(),
@@ -512,6 +566,16 @@ class MempoolManager:
                                 continue
                             if not self._validate_transaction_basic(tx):
                                 continue
+                            tx_type = str(tx.get("type") or "").lower()
+                            if tx_type in {"gtx_genesis", "genesis_bill"}:
+                                bill_serial = (
+                                    tx.get("bill_serial")
+                                    or tx.get("front_serial")
+                                    or tx.get("serial")
+                                    or tx.get("serial_number")
+                                )
+                                if bill_serial and self._has_gtx_serial(bill_serial):
+                                    continue
                             self.local_mempool[tx_hash] = {
                                 'transaction': tx,
                                 'timestamp': time.time(),

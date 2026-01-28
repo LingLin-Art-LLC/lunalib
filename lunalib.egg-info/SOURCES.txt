@@ -113,5 +113,6 @@ lunalib/transactions/__pycache__/transactions.cpython-310.pyc
 lunalib/transactions/__pycache__/validator.cpython-310.pyc
 lunalib/utils/__init__.py
 lunalib/utils/console.py
+lunalib/utils/formatting.py
 lunalib/utils/hash.py
 lunalib/utils/validation.py

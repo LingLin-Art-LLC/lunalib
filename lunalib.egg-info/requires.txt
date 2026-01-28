@@ -9,4 +9,6 @@ colorama
 msgpack
 
 [gpu]
+
+[gpu:python_version < "3.12"]
 cupy-cuda12x

@@ -19,6 +19,7 @@ from enum import Enum
 import json
 from datetime import datetime
 from lunalib.utils.console import print_info, print_success, print_warn
+from lunalib.utils.formatting import format_amount
 from lunalib.utils.validation import is_valid_address
 
 
@@ -70,7 +71,15 @@ class WalletBalance:
     
     def to_dict(self) -> Dict:
         """Convert to dictionary"""
-        return asdict(self)
+        data = asdict(self)
+        data.update({
+            "total_balance_display": format_amount(self.total_balance),
+            "available_balance_display": format_amount(self.available_balance),
+            "pending_incoming_display": format_amount(self.pending_incoming),
+            "pending_outgoing_display": format_amount(self.pending_outgoing),
+            "confirmed_balance_display": format_amount(self.confirmed_balance),
+        })
+        return data
 
 
 @dataclass

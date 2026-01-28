@@ -1562,7 +1562,8 @@ class Miner:
                 
                 # Security validation if available
                 if self.transaction_validator:
-                    if not self.transaction_validator.validate_transaction(tx):
+                    is_valid, _ = self.transaction_validator.validate_transaction(tx)
+                    if not is_valid:
                         continue
                 
                 valid_transactions.append(tx)
@@ -1580,17 +1581,25 @@ class Miner:
             if field not in tx:
                 return False
         
-        tx_type = tx.get('type')
+        tx_type = str(tx.get('type') or '').lower()
         
-        if tx_type == 'transaction':
+        if tx_type in {'transaction', 'transfer'}:
             if not all(k in tx for k in ['from', 'to', 'amount']):
                 return False
             # Reject self-transfers (from == to) as they fail server validation
             if tx.get('from') == tx.get('to'):
                 safe_print(f"⚠️  Filtering out self-transfer: {tx.get('from')} → {tx.get('to')}")
                 return False
-        elif tx_type == 'genesis_bill':
-            if 'denomination' not in tx:
+        elif tx_type in {'genesis_bill', 'gtx_genesis'}:
+            if 'denomination' not in tx and 'amount' not in tx:
+                return False
+            serial = tx.get('bill_serial') or tx.get('front_serial') or tx.get('serial') or tx.get('serial_number')
+            if not serial:
+                return False
+            if 'hash' not in tx:
+                return False
+            to_addr = tx.get('to') or tx.get('issued_to') or tx.get('owner_address')
+            if not to_addr:
                 return False
         elif tx_type == 'reward':
             if not all(k in tx for k in ['to', 'amount']):

@@ -57,6 +57,7 @@ import binascii
 import base64
 import hmac
 import threading
+from collections import OrderedDict
 import concurrent.futures
 from typing import Optional, Callable, Dict, List, Tuple
 from ..core.crypto import KeyManager
@@ -64,14 +65,50 @@ from ..core.sm4 import SM4Cipher
 from lunalib.config import apply_profile
 from .wallet_db import WalletDB
 from lunalib.utils.hash import derive_key_sm3, hmac_sm3
+from lunalib.utils.formatting import format_amount
 
 _WALLET_SALT = b"luna_wallet_salt"
+_KDF_CACHE_LOCK = threading.Lock()
+_KDF_CACHE: "OrderedDict[Tuple[bytes, int], bytes]" = OrderedDict()
 
 apply_profile()
 
 
+def _kdf_cache_key(password: str, iterations: int) -> Tuple[bytes, int]:
+    try:
+        pwd_bytes = password.encode()
+    except Exception:
+        pwd_bytes = str(password).encode()
+    digest = hmac_sm3(pwd_bytes, _WALLET_SALT)
+    return digest, iterations
+
+
 def _derive_wallet_key(password: str) -> bytes:
-    return derive_key_sm3(password, _WALLET_SALT, iterations=100000, dklen=32)
+    iterations = int(os.getenv("LUNALIB_WALLET_KDF_ITERATIONS", "100000"))
+    if iterations < 1:
+        iterations = 1
+
+    cache_enabled = os.getenv("LUNALIB_WALLET_KDF_CACHE", "0") == "1"
+    if not cache_enabled:
+        return derive_key_sm3(password, _WALLET_SALT, iterations=iterations, dklen=32)
+
+    cache_size = int(os.getenv("LUNALIB_WALLET_KDF_CACHE_SIZE", "16"))
+    if cache_size < 1:
+        cache_size = 1
+
+    cache_key = _kdf_cache_key(password, iterations)
+    with _KDF_CACHE_LOCK:
+        cached = _KDF_CACHE.get(cache_key)
+        if cached is not None:
+            _KDF_CACHE.move_to_end(cache_key)
+            return cached
+
+    derived = derive_key_sm3(password, _WALLET_SALT, iterations=iterations, dklen=32)
+    with _KDF_CACHE_LOCK:
+        _KDF_CACHE[cache_key] = derived
+        if len(_KDF_CACHE) > cache_size:
+            _KDF_CACHE.popitem(last=False)
+    return derived
 
 
 def _keystream(key: bytes, nonce: bytes, length: int) -> bytes:
@@ -111,7 +148,7 @@ def _encrypt_with_password(plaintext: bytes, password: str) -> bytes:
     return b"WL3" + nonce + ciphertext + mac
 
 
-def _decrypt_with_password(token, password: str) -> bytes:
+def _decrypt_with_password(token, password: str, derived_key: bytes = None) -> bytes:
     token_bytes = _normalize_token_bytes(token)
     if token_bytes.startswith(b"gAAAA"):
         raise ValueError("Legacy Fernet token not supported without cryptography")
@@ -119,7 +156,7 @@ def _decrypt_with_password(token, password: str) -> bytes:
         nonce = token_bytes[3:19]
         mac = token_bytes[-32:]
         ciphertext = token_bytes[19:-32]
-        key = _derive_wallet_key(password)
+        key = derived_key or _derive_wallet_key(password)
         expected_mac = hmac_sm3(key, nonce + ciphertext)
         if not hmac.compare_digest(mac, expected_mac):
             raise ValueError("Invalid password or corrupted data")
@@ -131,7 +168,7 @@ def _decrypt_with_password(token, password: str) -> bytes:
     nonce = token_bytes[3:19]
     mac = token_bytes[-32:]
     ciphertext = token_bytes[19:-32]
-    key = _derive_wallet_key(password)
+    key = derived_key or _derive_wallet_key(password)
     expected_mac = hmac_sm3(key, nonce + ciphertext)
     if not hmac.compare_digest(mac, expected_mac):
         raise ValueError("Invalid password or corrupted data")
@@ -164,6 +201,7 @@ class LunaWallet:
         self._ui_timer: Optional[threading.Timer] = None
         self._ui_handler_registered = False
         self._ui_event_handler_registered = False
+        self._session_kdf_cache: Dict[str, bytes] = {}
         self._load_wallets_from_db()
 
     def _load_wallets_from_db(self):
@@ -185,6 +223,7 @@ class LunaWallet:
             return {"success": False, "error": "Wallet not found"}
         self.wallets[addr]["is_locked"] = True
         self.wallets[addr]["private_key"] = None
+        self._session_kdf_cache.pop(addr, None)
         if addr == self.current_wallet_address:
             self.private_key = None
             self.is_locked = True
@@ -200,13 +239,21 @@ class LunaWallet:
         if address not in self.wallets:
             return {"success": False, "error": f"Wallet {address} not found"}
         wallet_data = self.wallets[address]
+        if not wallet_data.get("is_locked") and wallet_data.get("private_key"):
+            return {"success": True}
         try:
             if wallet_data.get("encrypted_private_key"):
+                cache_enabled = os.getenv("LUNALIB_WALLET_SESSION_CACHE", "0") == "1"
+                derived_key = self._session_kdf_cache.get(address) if cache_enabled else None
+                if cache_enabled and derived_key is None:
+                    derived_key = _derive_wallet_key(password)
                 decrypted_key = _decrypt_with_password(
-                    wallet_data["encrypted_private_key"], password
+                    wallet_data["encrypted_private_key"], password, derived_key=derived_key
                 )
                 wallet_data["private_key"] = decrypted_key.decode()
                 wallet_data["is_locked"] = False
+                if cache_enabled and derived_key is not None:
+                    self._session_kdf_cache[address] = derived_key
                 if self.current_wallet_address == address:
                     self.private_key = wallet_data["private_key"]
                     self.is_locked = False
@@ -233,6 +280,8 @@ class LunaWallet:
                 "is_locked": data.get("is_locked", True),
                 "balance": data.get("balance", 0.0),
                 "available_balance": data.get("available_balance", 0.0),
+                "balance_display": format_amount(data.get("balance", 0.0)),
+                "available_balance_display": format_amount(data.get("available_balance", 0.0)),
             })
         return index
 
@@ -248,6 +297,8 @@ class LunaWallet:
             "is_locked": data.get("is_locked", True),
             "balance": data.get("balance", 0.0),
             "available_balance": data.get("available_balance", 0.0),
+            "balance_display": format_amount(data.get("balance", 0.0)),
+            "available_balance_display": format_amount(data.get("available_balance", 0.0)),
             "created": data.get("created", 0),
             "public_key": data.get("public_key", ""),
         }
@@ -271,6 +322,11 @@ class LunaWallet:
                 "pending_in": balance_data.get("pending_incoming", 0.0),
                 "pending_out": balance_data.get("pending_outgoing", 0.0),
                 "total_balance": balance_data.get("total_balance", 0.0),
+                "balance_display": format_amount(balance_data.get("confirmed_balance", 0.0)),
+                "available_balance_display": format_amount(balance_data.get("available_balance", 0.0)),
+                "pending_in_display": format_amount(balance_data.get("pending_incoming", 0.0)),
+                "pending_out_display": format_amount(balance_data.get("pending_outgoing", 0.0)),
+                "total_balance_display": format_amount(balance_data.get("total_balance", 0.0)),
             }
         except Exception as e:
             return {"success": False, "error": f"Failed to get balance: {e}"}
@@ -340,6 +396,7 @@ class LunaWallet:
         self._reset_current_wallet()
         self._confirmed_tx_cache: Dict[str, List[Dict]] = {}
         self._pending_tx_cache: Dict[str, List[Dict]] = {}
+        self._session_kdf_cache: Dict[str, bytes] = {}
 
     # ----------------------
     # Address normalization
@@ -523,17 +580,25 @@ class LunaWallet:
             return False
 
         wallet_data = self.wallets[address]
+        if not wallet_data.get("is_locked") and wallet_data.get("private_key"):
+            return True
 
         try:
             if wallet_data.get("encrypted_private_key"):
+                cache_enabled = os.getenv("LUNALIB_WALLET_SESSION_CACHE", "0") == "1"
+                derived_key = self._session_kdf_cache.get(address) if cache_enabled else None
+                if cache_enabled and derived_key is None:
+                    derived_key = _derive_wallet_key(password)
                 # Decrypt private key
                 decrypted_key = _decrypt_with_password(
-                    wallet_data["encrypted_private_key"], password
+                    wallet_data["encrypted_private_key"], password, derived_key=derived_key
                 )
 
                 # Update wallet data
                 wallet_data["private_key"] = decrypted_key.decode()
                 wallet_data["is_locked"] = False
+                if cache_enabled and derived_key is not None:
+                    self._session_kdf_cache[address] = derived_key
 
                 # If this is the current wallet, update current state
                 if self.current_wallet_address == address:
@@ -691,7 +756,7 @@ class LunaWallet:
             if to_norm == target_norm:
                 # For rewards, only count as pending if confirmations < 6
                 if tx_type == "reward" or str(tx.get("from") or "").lower() in {"ling country", "ling country mines", "foreign exchange", "network", "block_reward", "mining_reward", "coinbase"}:
-                    if confirmations is not None and confirmations < required_conf:
+                    if confirmations is None or confirmations < required_conf:
                         pending_in += amount
                 else:
                     pending_in += amount
@@ -801,6 +866,10 @@ class LunaWallet:
                     "available_balance": available_balance,
                     "pending_out": pending_out,
                     "pending_in": pending_in,
+                    "balance_display": format_amount(total_balance),
+                    "available_balance_display": format_amount(available_balance),
+                    "pending_out_display": format_amount(pending_out),
+                    "pending_in_display": format_amount(pending_in),
                 }
 
             return updated
@@ -829,6 +898,10 @@ class LunaWallet:
                 "available_balance": wallet_data.get("available_balance", 0.0),
                 "pending_out": wallet_data.get("pending_out", 0.0),
                 "pending_in": wallet_data.get("pending_in", 0.0),
+                "balance_display": format_amount(wallet_data.get("balance", 0.0)),
+                "available_balance_display": format_amount(wallet_data.get("available_balance", 0.0)),
+                "pending_out_display": format_amount(wallet_data.get("pending_out", 0.0)),
+                "pending_in_display": format_amount(wallet_data.get("pending_in", 0.0)),
             }
 
             if include_transactions:
@@ -1515,9 +1588,15 @@ class LunaWallet:
 
         try:
             if wallet_data.get("encrypted_private_key"):
+                cache_enabled = os.getenv("LUNALIB_WALLET_SESSION_CACHE", "0") == "1"
+                derived_key = self._session_kdf_cache.get(address) if cache_enabled else None
+                if cache_enabled and derived_key is None:
+                    derived_key = _derive_wallet_key(password)
                 decrypted_key = _decrypt_with_password(
-                    wallet_data["encrypted_private_key"], password
+                    wallet_data["encrypted_private_key"], password, derived_key=derived_key
                 )
+                if cache_enabled and derived_key is not None:
+                    self._session_kdf_cache[address] = derived_key
                 return decrypted_key.decode()
         except:
             pass

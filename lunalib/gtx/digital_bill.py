@@ -46,9 +46,11 @@ class DigitalBill:
     
     def _generate_serial(self):
         """Generate unique bill serial number"""
-        timestamp = int(time.time() * 1000)
-        random_part = secrets.token_hex(4)
-        return f"GTX{self.denomination}_{timestamp}_{random_part}"
+        date_part = time.strftime("%Y%m%d", time.gmtime())
+        random_bytes = secrets.token_bytes(10)
+        random_part = base64.b32encode(random_bytes).decode("utf-8").strip("=")
+        denom = int(self.denomination) if float(self.denomination).is_integer() else self.denomination
+        return f"GTX-{denom}-{date_part}-{random_part}"
     
     def _generate_metadata_hash(self):
         """Generate metadata hash for the bill"""
@@ -84,6 +86,7 @@ class DigitalBill:
             "to": self.user_address,
             "amount": self.denomination,
             "bill_serial": self.bill_serial,
+            "serial_number": self.bill_serial,
             "mining_difficulty": self.difficulty,
             "mining_time": mining_time,
             "hash": hash,

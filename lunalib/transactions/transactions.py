@@ -275,15 +275,34 @@ class TransactionManager:
     # SYSTEM TRANSACTIONS (unsigned)
     def create_gtx_transaction(self, bill_info: Dict) -> Dict:
         """Create GTX Genesis transaction from mined bill"""
+        tx_data = bill_info.get("transaction_data") or {}
+        bill_serial = bill_info.get("bill_serial") or bill_info.get("serial") or tx_data.get("bill_serial") or ""
+        denomination = bill_info.get("denomination", tx_data.get("denomination", 0))
+        mining_difficulty = bill_info.get("difficulty", tx_data.get("mining_difficulty", 0))
+        nonce = bill_info.get("nonce", tx_data.get("nonce", 0))
+        timestamp = bill_info.get("timestamp", tx_data.get("timestamp", int(time.time())))
+        to_address = (
+            bill_info.get("user_address")
+            or tx_data.get("to")
+            or tx_data.get("issued_to")
+            or bill_info.get("issued_to")
+            or "unknown"
+        )
+        from_address = tx_data.get("from") or bill_info.get("from") or "genesis_network"
+        issued_to = bill_info.get("issued_to") or tx_data.get("issued_to") or to_address
         transaction = {
             "type": "gtx_genesis",
-            "from": "mining",
-            "to": bill_info.get("owner_address", "unknown"),
-            "amount": float(bill_info.get("denomination", 0)),
+            "from": from_address,
+            "to": to_address,
+            "amount": float(denomination or 0),
             "fee": 0.0,
-            "timestamp": int(time.time()),
-            "bill_serial": bill_info.get("serial", ""),
-            "mining_difficulty": bill_info.get("difficulty", 0),
+            "timestamp": int(timestamp),
+            "bill_serial": bill_serial,
+            "serial_number": bill_serial,
+            "issued_to": issued_to,
+            "denomination": denomination,
+            "nonce": nonce,
+            "mining_difficulty": mining_difficulty,
             "signature": "system",
             "public_key": "system",
             "version": "2.0"
